@@ -1,0 +1,74 @@
+__include__: [
+  '../deim_rtdetrv2/rtdetrv2_r34vd_120e_coco.yml',
+  '../base/rt_deim.yml',
+]
+
+output_dir: ./outputs/deim_rtdetrv2_r34vd_120e_ssdd
+
+optimizer:
+  type: AdamW
+  params: 
+    - 
+      params: '^(?=.*backbone)(?!.*norm).*$'
+      lr: 0.0001
+    - 
+      params: '^(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+
+  lr: 0.0002
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+# change part
+epoches: 120
+flat_epoch: 64    # 4 + 60 / 2
+no_aug_epoch: 3
+
+eval_spatial_size: [512, 512]
+
+train_dataloader: 
+  dataset: 
+    transforms:
+      ops:
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomZoomOut, fill: 0}
+        - {type: RandomIoUCrop, p: 0.8}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [512, 512], }
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+      policy:
+        epoch: [4, 64, 117]   # list
+  total_batch_size: 4
+  collate_fn:
+    ema_restart_decay: 0.9999
+    base_size: 512
+    base_size_repeat: 20
+    mixup_epochs: [4, 64]
+    stop_epoch: 117
+    copyblend_prob: 0.5
+    # copyblend_epochs: [4, 64]   # from v11 to v12: copy-paste continues only half epochs
+    copyblend_epochs: [4, 117]
+    area_threshold: 100
+    num_objects: 3
+    with_expand: True
+    expand_ratios: [0.1, 0.25]
+
+val_dataloader:
+  dataset:
+    transforms:
+      ops:
+        - {type: Resize, size: [512, 512], }
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+  shuffle: False
+  total_batch_size: 4
+  num_workers: 4
+
+DEIMCriterion:
+  matcher:
+    # new matcher
+    change_matcher: True
+    iou_order_alpha: 4.0
+    matcher_change_epoch: 100

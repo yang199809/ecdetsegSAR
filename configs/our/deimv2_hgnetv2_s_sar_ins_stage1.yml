@@ -42,9 +42,9 @@ DEIMv2_SAR_INS_STAGE1:
     mask_output_stride: 8
     mask_num_blocks: 3
     use_mask_aux_loss: True
-    use_sparse_mask_train: True
-    use_weak_geometry: True
-    return_geometry: True
+    use_sparse_mask_train: False
+    use_weak_geometry: False
+    return_geometry: False
     enable_timing: True
     timing_sync_cuda: False
 
@@ -95,7 +95,7 @@ train_dataloader:
   total_batch_size: 4
   dataset:
     return_masks: True
-    return_weak_geometry: True
+    return_weak_geometry: False
     use_category2label: True
     transforms:
       ops:
@@ -145,13 +145,9 @@ SARStage1Criterion:
     loss_fgl: 0.15,
     loss_ddf: 1.5,
     loss_mask_bce: 5.0,
-    loss_mask_dice: 5.0,
-    loss_geo_center: 1.0,
-    loss_geo_scale: 1.0,
-    loss_geo_dir: 1.0,
-    loss_geo_ani: 0.5
+    loss_mask_dice: 5.0
   }
-  losses: ['mal', 'boxes', 'local', 'masks', 'weak_geometry']
+  losses: ['mal', 'boxes', 'local', 'masks']
   gamma: 1.5
   alpha: 0.75
   reg_max: 32

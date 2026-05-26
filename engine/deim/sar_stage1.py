@@ -227,7 +227,7 @@ class SARStage1DEIMTransformer(DEIMTransformer):
             mask_output_stride=self.mask_output_stride,
             use_sparse_train=use_sparse_mask_train,
         )
-        self.weak_geometry_init = WeakGeometryQueryInit(hidden_dim)
+        self.weak_geometry_init = WeakGeometryQueryInit(hidden_dim) if use_weak_geometry else None
 
     def _build_mask_refine(self, mask_hidden_dim):
         """Optionally refine the stride-8 mask feature to a higher spatial resolution."""
@@ -328,7 +328,7 @@ class SARStage1DEIMTransformer(DEIMTransformer):
             content = enc_topk_memory.detach()
 
         geo_outputs = {}
-        if self.use_weak_geometry:
+        if self.weak_geometry_init is not None:
             content, geo_outputs = self.weak_geometry_init(
                 content,
                 reference_boxes=F.sigmoid(enc_topk_bbox_unact.detach()),

@@ -1,6 +1,6 @@
 # DEIMv2 SAR Instance Segmentation Stage 1
 
-This branch adds a lightweight query-based SAR ship instance segmentation path on top of DEIMv2. The backbone, HybridEncoder, detection decoder, dense positive detection losses, and weak-geometry query branch are kept intact.
+This branch adds a lightweight query-based SAR ship instance segmentation path on top of DEIMv2. The default Stage-1 setup focuses on a stable instance-segmentation loop: `pred_masks`, mask-aware matching, mask BCE/Dice losses, COCO `bbox`/`segm` evaluation, and mask postprocessing. Optional weak-geometry code remains available for later ablations but is disabled by default.
 
 ## Main Configs
 
@@ -11,9 +11,9 @@ Key switches:
 
 - `mask_output_stride`: `8` by default; set to `4` for higher-resolution mask supervision.
 - `use_mask_aux_loss`: adds mask BCE/Dice to decoder auxiliary outputs.
-- `use_sparse_mask_train`: returns pixel/query mask embeddings during training so the criterion can rebuild only matched masks.
+- `use_sparse_mask_train`: optional memory-saving sparse mask path; disabled by default for the stable Stage-1 loop.
 - `mask_point_sample_ratio`: enables point-sampled mask BCE/Dice and mask matching.
-- `return_weak_geometry`: enabled for training, disabled for validation/test.
+- `use_weak_geometry` / `return_weak_geometry`: optional later ablation path; both are disabled by default.
 
 ## Training
 
@@ -58,4 +58,4 @@ python tools/smoke_test_sar_stage1.py \
   --device cpu
 ```
 
-The smoke test covers config construction, dummy inference, postprocessing, auxiliary mask losses, weak geometry targets, and finite loss values.
+The smoke test covers config construction, dummy inference, postprocessing, auxiliary mask losses, detection-only compatibility, and finite loss values.

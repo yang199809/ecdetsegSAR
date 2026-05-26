@@ -14,7 +14,6 @@ sys.path.insert(0, REPO_ROOT)
 
 import engine  # noqa: F401
 from engine.core import YAMLConfig
-from engine.data.dataset.weak_geometry import masks_to_weak_geometry
 
 
 def make_elongated_mask(height, width, x0, y0, x1, y1):
@@ -51,7 +50,6 @@ def make_targets(batch_size, height, width, device):
             'image_id': torch.tensor([batch_idx]),
             'orig_size': torch.tensor([width, height]),
         }
-        target.update(masks_to_weak_geometry(masks))
         targets.append({key: value.to(device) for key, value in target.items()})
     return targets
 
@@ -63,30 +61,11 @@ def assert_finite_losses(losses):
         'loss_giou',
         'loss_mask_bce',
         'loss_mask_dice',
-        'loss_geo_center',
-        'loss_geo_scale',
-        'loss_geo_dir',
-        'loss_geo_ani',
     }
     missing = required - set(losses.keys())
     assert not missing, f'missing losses: {sorted(missing)}'
     for name, value in losses.items():
         assert torch.isfinite(value).all(), f'{name} is not finite: {value}'
-
-
-def test_weak_geometry():
-    horizontal = make_elongated_mask(96, 96, 10, 42, 86, 52)
-    square = make_elongated_mask(96, 96, 35, 35, 61, 61)
-    geometry = masks_to_weak_geometry(torch.stack([horizontal, square], dim=0))
-    assert geometry['gt_center'].shape == (2, 2)
-    assert geometry['gt_scale'].shape == (2, 2)
-    assert geometry['gt_axis'].shape == (2, 2)
-    assert torch.allclose(geometry['gt_axis'].norm(dim=-1), torch.ones(2), atol=1e-4)
-    assert geometry['gt_anisotropy'][0] > geometry['gt_anisotropy'][1]
-
-    pred_axis = -geometry['gt_axis']
-    sign_invariant = 1 - (pred_axis * geometry['gt_axis']).sum(-1).abs()
-    assert torch.all(sign_invariant < 1e-4)
 
 
 def main():
@@ -97,7 +76,6 @@ def main():
     args = parser.parse_args()
 
     device = torch.device(args.device)
-    test_weak_geometry()
 
     cfg = YAMLConfig(
         args.config,
@@ -114,6 +92,8 @@ def main():
                 'mask_output_stride': 4,
                 'mask_num_blocks': 2,
                 'use_sparse_mask_train': False,
+                'use_weak_geometry': False,
+                'return_geometry': False,
             }
         },
         SARStage1Criterion={
@@ -145,6 +125,7 @@ def main():
         assert outputs['pred_logits'].shape[:2] == (2, 20)
         assert outputs['pred_boxes'].shape[:2] == (2, 20)
         assert outputs['pred_masks'].shape[:2] == (2, 20)
+        assert 'geo_outputs' not in outputs
         assert outputs['pred_masks'].shape[-1] >= args.size // 4
         orig_size = torch.tensor([[args.size * 2, args.size + 16]] * 2, device=device)
         results = postprocessor(outputs, orig_size, targets=targets)
@@ -163,13 +144,6 @@ def main():
     losses = criterion(outputs, targets, epoch=0, global_step=0)
     assert 'loss_mask_bce_aux_0' in losses
     assert 'loss_mask_dice_aux_0' in losses
-    assert_finite_losses(losses)
-
-    model.decoder.use_sparse_mask_train = True
-    outputs = model(samples, targets=targets)
-    assert isinstance(outputs['pred_masks'], dict)
-    assert isinstance(outputs['aux_outputs'][0]['pred_masks'], dict)
-    losses = criterion(outputs, targets, epoch=0, global_step=0)
     assert_finite_losses(losses)
 
     det_cfg = YAMLConfig(

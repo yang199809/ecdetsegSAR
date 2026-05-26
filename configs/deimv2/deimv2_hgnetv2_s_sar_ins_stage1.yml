@@ -39,7 +39,7 @@ DEIMv2_SAR_INS_STAGE1:
     mlp_act: silu
     dim_feedforward: 2048
     mask_hidden_dim: 128
-    mask_output_stride: 8
+    mask_output_stride: 4
     mask_num_blocks: 3
     use_mask_aux_loss: True
     use_sparse_mask_train: False
@@ -134,9 +134,9 @@ val_dataloader:
 
 SARStage1Criterion:
   weight_dict: {
-    loss_mal: 1,
-    loss_bbox: 5,
-    loss_giou: 2,
+    loss_mal: 2.0,
+    loss_bbox: 1,
+    loss_giou: 1,
     loss_fgl: 0.15,
     loss_ddf: 1.5,
     loss_mask_bce: 5.0,
@@ -153,11 +153,11 @@ SARStage1Criterion:
   importance_sample_ratio: 0.75
   matcher:
     type: HungarianMatcher
-    weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 2, cost_mask_bce: 1.0, cost_mask_dice: 1.0}
+    weight_dict: {cost_class: 2, cost_bbox: 1, cost_giou: 1, cost_mask_bce: 1.0, cost_mask_dice: 1.0}
     alpha: 0.25
     gamma: 2.0
-    mask_cost_downsample_size: 64
-    mask_point_sample_ratio: 0
+    mask_cost_downsample_size: ~
+    mask_point_sample_ratio: 16
     mask_cost_valid_area_eps: 1.0e-6
     diagnostics: True
     diagnostics_interval: 50

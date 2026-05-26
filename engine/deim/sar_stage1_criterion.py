@@ -166,15 +166,15 @@ class SARStage1Criterion(DEIMCriterion):
         ], dim=0).to(device=device, dtype=dtype)
 
         source_masks = target_masks
-        target_masks = F.interpolate(
-            target_masks[:, None],
+        resized_target_masks = F.interpolate(
+            source_masks[:, None],
             size=src_masks.shape[-2:],
             mode='nearest',
         )[:, 0]
         if enable_diagnostics:
             self._report_mask_resize_diagnostics(
                 source_masks,
-                target_masks,
+                resized_target_masks,
                 src_masks.shape[-2:],
                 step=step,
                 branch=branch,
@@ -183,9 +183,12 @@ class SARStage1Criterion(DEIMCriterion):
 
         point_coords = self._sample_points(src_masks)
         if point_coords is not None:
+            # Sample GT masks at their native training resolution. This avoids erasing
+            # tiny SAR ship masks by first resizing them down to pred_masks resolution.
             src_for_loss = self._point_sample(src_masks, point_coords)
-            target_for_loss = self._point_sample(target_masks, point_coords, mode='nearest')
+            target_for_loss = self._point_sample(source_masks, point_coords, mode='nearest')
         else:
+            target_masks = resized_target_masks
             src_for_loss = src_masks.flatten(1)
             target_for_loss = target_masks.flatten(1)
 

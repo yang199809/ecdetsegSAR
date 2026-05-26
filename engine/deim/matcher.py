@@ -79,6 +79,17 @@ class HungarianMatcher(nn.Module):
             return SARSegmentationHead.materialize_sparse(pred_masks)
         return pred_masks
 
+    @staticmethod
+    def _point_sample(masks, point_coords, mode='bilinear'):
+        grid = point_coords.mul(2.0).sub(1.0).unsqueeze(2)
+        samples = F.grid_sample(
+            masks[:, None],
+            grid,
+            mode=mode,
+            align_corners=False,
+        )
+        return samples[:, 0, :, 0]
+
     def _compute_mask_cost(self, outputs, targets, step=None):
         if ((self.cost_mask_bce == 0 and self.cost_mask_dice == 0) or
                 'pred_masks' not in outputs or
@@ -87,32 +98,16 @@ class HungarianMatcher(nn.Module):
 
         pred_masks = self._materialize_pred_masks(outputs['pred_masks'])
         bs, num_queries, mask_h, mask_w = pred_masks.shape
-        if self.mask_cost_downsample_size is not None:
-            size = int(self.mask_cost_downsample_size)
-            pred_masks = F.interpolate(
-                pred_masks.flatten(0, 1)[:, None],
-                size=(size, size),
-                mode='bilinear',
-                align_corners=False,
-            )[:, 0].view(bs, num_queries, size, size)
-            mask_h = mask_w = size
 
         target_masks = []
         source_areas = []
-        downsampled_areas = []
         for target in targets:
             masks = target['masks'].to(device=pred_masks.device, dtype=pred_masks.dtype)
             if masks.numel() == 0:
-                target_masks.append(masks.reshape(0, mask_h, mask_w))
+                target_masks.append(masks)
                 continue
             source_areas.append(masks.flatten(1).sum(1).detach())
-            masks = F.interpolate(
-                masks[:, None].float(),
-                size=(mask_h, mask_w),
-                mode='area',
-            )[:, 0].clamp_(0, 1)
             target_masks.append(masks)
-            downsampled_areas.append(masks.flatten(1).sum(1).detach())
 
         if target_masks:
             target_masks = torch.cat(target_masks, dim=0)
@@ -121,33 +116,55 @@ class HungarianMatcher(nn.Module):
         if target_masks.numel() == 0:
             return pred_masks.new_zeros((bs * num_queries, 0))
 
-        if self._should_report(step) and source_areas and downsampled_areas:
-            source_areas_cat = torch.cat(source_areas).float()
-            down_areas_cat = torch.cat(downsampled_areas).float()
-            source_empty_frac = (source_areas_cat <= self.mask_cost_valid_area_eps).float().mean().item()
-            down_empty_frac = (down_areas_cat <= self.mask_cost_valid_area_eps).float().mean().item()
-            print(
-                "[SARStage1][matcher] GT mask area before matching downsample "
-                f"mean={source_areas_cat.mean().item():.2f} "
-                f"min={source_areas_cat.min().item():.2f} "
-                f"max={source_areas_cat.max().item():.2f}; "
-                f"source_empty_fraction={source_empty_frac:.4f}; "
-                f"after downsample to {mask_h}x{mask_w} "
-                f"mean={down_areas_cat.mean().item():.2f} "
-                f"min={down_areas_cat.min().item():.2f} "
-                f"max={down_areas_cat.max().item():.2f}; "
-                f"downsample_empty_fraction={down_empty_frac:.4f}"
+        valid_target = target_masks.flatten(1).sum(1) > self.mask_cost_valid_area_eps
+        if self.mask_point_sample_ratio > 0:
+            # EdgeCrafter-style normalized point sampling keeps GT masks at their
+            # transformed image resolution instead of forcing them to 64x64/100x100.
+            num_points = max(mask_h, (mask_h * mask_w) // self.mask_point_sample_ratio)
+            point_coords = torch.rand(1, num_points, 2, device=pred_masks.device)
+            pred_flat = self._point_sample(
+                pred_masks.flatten(0, 1),
+                point_coords.repeat(bs * num_queries, 1, 1),
             )
-
-        pred_flat = pred_masks.flatten(0, 1).flatten(1)
-        target_flat = target_masks.flatten(1)
-        valid_target = target_flat.sum(1) > self.mask_cost_valid_area_eps
-        if self.mask_point_sample_ratio > 0 and pred_flat.shape[-1] > 0:
-            num_points = max(1, pred_flat.shape[-1] // self.mask_point_sample_ratio)
-            if num_points < pred_flat.shape[-1]:
-                point_idx = torch.randperm(pred_flat.shape[-1], device=pred_flat.device)[:num_points]
-                pred_flat = pred_flat[:, point_idx]
-                target_flat = target_flat[:, point_idx]
+            target_flat = self._point_sample(
+                target_masks,
+                point_coords.repeat(target_masks.shape[0], 1, 1),
+                mode='nearest',
+            )
+            if self._should_report(step) and source_areas:
+                source_areas_cat = torch.cat(source_areas).float()
+                sampled_areas = target_flat.detach().sum(1).float()
+                source_empty_frac = (source_areas_cat <= self.mask_cost_valid_area_eps).float().mean().item()
+                sampled_empty_frac = (sampled_areas <= self.mask_cost_valid_area_eps).float().mean().item()
+                print(
+                    "[SARStage1][matcher] GT mask area before point sampling "
+                    f"mean={source_areas_cat.mean().item():.2f} "
+                    f"min={source_areas_cat.min().item():.2f} "
+                    f"max={source_areas_cat.max().item():.2f}; "
+                    f"source_empty_fraction={source_empty_frac:.4f}; "
+                    f"sampled_points={num_points}; "
+                    f"sampled_positive_count mean={sampled_areas.mean().item():.2f} "
+                    f"min={sampled_areas.min().item():.2f} "
+                    f"max={sampled_areas.max().item():.2f}; "
+                    f"sampled_empty_fraction={sampled_empty_frac:.4f}"
+                )
+        else:
+            if self.mask_cost_downsample_size is not None:
+                size = int(self.mask_cost_downsample_size)
+                pred_masks = F.interpolate(
+                    pred_masks.flatten(0, 1)[:, None],
+                    size=(size, size),
+                    mode='bilinear',
+                    align_corners=False,
+                )[:, 0].view(bs, num_queries, size, size)
+                mask_h = mask_w = size
+                target_masks = F.interpolate(
+                    target_masks[:, None].float(),
+                    size=(mask_h, mask_w),
+                    mode='area',
+                )[:, 0].clamp_(0, 1)
+            pred_flat = pred_masks.flatten(0, 1).flatten(1)
+            target_flat = target_masks.flatten(1)
         num_pixels = float(pred_flat.shape[-1])
 
         total_cost = pred_flat.new_zeros((pred_flat.shape[0], target_flat.shape[0]))

@@ -4,15 +4,15 @@ This branch adds a lightweight query-based SAR ship instance segmentation path o
 
 ## Main Configs
 
-- `configs/our/deimv2_hgnetv2_s_sar_ins_stage1.yml`: default stride-8 mask branch.
-- `configs/our/deimv2_hgnetv2_s_sar_ins_stage1_mask_stride4.yml`: stride-4 mask-resolution ablation for tiny or elongated ship masks.
+- `configs/our/deimv2_hgnetv2_s_sar_ins_stage1.yml`: default stride-4 mask branch for tiny or elongated ship masks.
+- `configs/our/deimv2_hgnetv2_s_sar_ins_stage1_mask_stride4.yml`: explicit stride-4 alias for ablation runs.
 
 Key switches:
 
-- `mask_output_stride`: `8` by default; set to `4` for higher-resolution mask supervision.
+- `mask_output_stride`: `4` by default; set to `8` only for lower-resolution ablations.
 - `use_mask_aux_loss`: adds mask BCE/Dice to decoder auxiliary outputs.
 - `use_sparse_mask_train`: optional memory-saving sparse mask path; disabled by default for the stable Stage-1 loop.
-- `mask_point_sample_ratio`: enables point-sampled mask BCE/Dice and mask matching.
+- `mask_point_sample_ratio`: enables point-sampled mask BCE/Dice and mask matching. GT masks are sampled at their transformed image resolution rather than being downsampled before loss/matching.
 - `use_weak_geometry` / `return_weak_geometry`: optional later ablation path; both are disabled by default.
 
 ## Training

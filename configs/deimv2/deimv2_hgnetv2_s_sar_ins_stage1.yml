@@ -150,7 +150,8 @@ SARStage1Criterion:
     weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 2, cost_mask_bce: 1.0, cost_mask_dice: 1.0}
     alpha: 0.25
     gamma: 2.0
-    mask_cost_downsample_size: 32
+    mask_cost_downsample_size: 64
+    mask_cost_valid_area_eps: 1.0e-6
     diagnostics: True
     diagnostics_interval: 50
     change_matcher: True

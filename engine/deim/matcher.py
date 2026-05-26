@@ -32,7 +32,8 @@ class HungarianMatcher(nn.Module):
 
     def __init__(self, weight_dict, use_focal_loss=False, alpha=0.25, gamma=2.0,
                 change_matcher=False, iou_order_alpha=1.0, matcher_change_epoch=10000,
-                mask_cost_downsample_size=None, diagnostics=False, diagnostics_interval=100):
+                mask_cost_downsample_size=None, mask_cost_valid_area_eps=1e-6,
+                diagnostics=False, diagnostics_interval=100):
         """Creates the matcher
 
         Params:
@@ -47,6 +48,7 @@ class HungarianMatcher(nn.Module):
         self.cost_mask_bce = weight_dict.get('cost_mask_bce', 0.0)
         self.cost_mask_dice = weight_dict.get('cost_mask_dice', 0.0)
         self.mask_cost_downsample_size = mask_cost_downsample_size
+        self.mask_cost_valid_area_eps = float(mask_cost_valid_area_eps)
         self.diagnostics = diagnostics
         self.diagnostics_interval = int(diagnostics_interval)
 
@@ -97,7 +99,11 @@ class HungarianMatcher(nn.Module):
                 target_masks.append(masks.reshape(0, mask_h, mask_w))
                 continue
             source_areas.append(masks.flatten(1).sum(1).detach())
-            masks = F.interpolate(masks[:, None], size=(mask_h, mask_w), mode='nearest')[:, 0]
+            masks = F.interpolate(
+                masks[:, None].float(),
+                size=(mask_h, mask_w),
+                mode='area',
+            )[:, 0].clamp_(0, 1)
             target_masks.append(masks)
             downsampled_areas.append(masks.flatten(1).sum(1).detach())
 
@@ -111,22 +117,25 @@ class HungarianMatcher(nn.Module):
         if self._should_report(step) and source_areas and downsampled_areas:
             source_areas_cat = torch.cat(source_areas).float()
             down_areas_cat = torch.cat(downsampled_areas).float()
-            empty_frac = (down_areas_cat <= 0).float().mean().item()
+            source_empty_frac = (source_areas_cat <= self.mask_cost_valid_area_eps).float().mean().item()
+            down_empty_frac = (down_areas_cat <= self.mask_cost_valid_area_eps).float().mean().item()
             print(
                 "[SARStage1][matcher] GT mask area before matching downsample "
                 f"mean={source_areas_cat.mean().item():.2f} "
                 f"min={source_areas_cat.min().item():.2f} "
                 f"max={source_areas_cat.max().item():.2f}; "
+                f"source_empty_fraction={source_empty_frac:.4f}; "
                 f"after downsample to {mask_h}x{mask_w} "
                 f"mean={down_areas_cat.mean().item():.2f} "
                 f"min={down_areas_cat.min().item():.2f} "
                 f"max={down_areas_cat.max().item():.2f}; "
-                f"empty_fraction={empty_frac:.4f}"
+                f"downsample_empty_fraction={down_empty_frac:.4f}"
             )
 
         pred_flat = pred_masks.flatten(0, 1).flatten(1)
         target_flat = target_masks.flatten(1)
         num_pixels = float(pred_flat.shape[-1])
+        valid_target = target_flat.sum(1) > self.mask_cost_valid_area_eps
 
         total_cost = pred_flat.new_zeros((pred_flat.shape[0], target_flat.shape[0]))
         if self.cost_mask_bce != 0:
@@ -141,6 +150,9 @@ class HungarianMatcher(nn.Module):
             denominator = pred_prob.sum(1, keepdim=True) + target_flat.sum(1).unsqueeze(0)
             cost_dice = 1 - (numerator + 1) / (denominator + 1)
             total_cost = total_cost + self.cost_mask_dice * cost_dice
+
+        if not valid_target.all():
+            total_cost[:, ~valid_target] = 0.0
 
         return total_cost
 

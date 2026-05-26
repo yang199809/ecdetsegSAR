@@ -9,6 +9,8 @@ Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 
 import sys
 import math
+import inspect
+import time
 from typing import Iterable
 
 import torch
@@ -145,7 +147,10 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
 
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
 
-        results = postprocessor(outputs, orig_target_sizes)
+        if 'targets' in inspect.signature(postprocessor.forward).parameters:
+            results = postprocessor(outputs, orig_target_sizes, targets=targets)
+        else:
+            results = postprocessor(outputs, orig_target_sizes)
 
         # if 'segm' in postprocessor.keys():
         #     target_sizes = torch.stack([t["size"] for t in targets], dim=0)
@@ -153,7 +158,19 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
 
         res = {target['image_id'].item(): output for target, output in zip(targets, results)}
         if coco_evaluator is not None:
+            t0 = time.perf_counter()
             coco_evaluator.update(res)
+            evaluator_update_ms = (time.perf_counter() - t0) * 1000.0
+            timing = {}
+            for timing_source in (
+                    outputs.get('timings', {}),
+                    getattr(postprocessor, 'last_timing', {}),
+                    getattr(coco_evaluator, 'last_timing', {})):
+                for key, value in timing_source.items():
+                    timing[key] = timing.get(key, 0.0) + float(value)
+            timing['evaluator_update'] = evaluator_update_ms
+            for key, value in timing.items():
+                metric_logger.update(**{f'time_{key}': float(value)})
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()

@@ -2,6 +2,7 @@
 Minimal Stage-1 SAR instance segmentation extension for DEIMv2.
 """
 
+import time
 from collections import OrderedDict
 
 import torch
@@ -171,7 +172,9 @@ class SARStage1DEIMTransformer(DEIMTransformer):
                  share_score_head=False,
                  mask_hidden_dim=128,
                  use_weak_geometry=True,
-                 return_geometry=True):
+                 return_geometry=True,
+                 enable_timing=False,
+                 timing_sync_cuda=False):
         super().__init__(
             num_classes=num_classes,
             hidden_dim=hidden_dim,
@@ -206,9 +209,27 @@ class SARStage1DEIMTransformer(DEIMTransformer):
         self.mask_hidden_dim = mask_hidden_dim
         self.use_weak_geometry = use_weak_geometry
         self.return_geometry = return_geometry
+        self.enable_timing = enable_timing
+        self.timing_sync_cuda = timing_sync_cuda
         self.pixel_decoder = LightweightPixelDecoder(hidden_dim, mask_hidden_dim, num_levels)
         self.mask_head = QueryBasedMaskHead(hidden_dim, mask_hidden_dim)
         self.weak_geometry_init = WeakGeometryQueryInit(hidden_dim)
+
+    def _sync(self, tensor):
+        if self.timing_sync_cuda and torch.is_tensor(tensor) and tensor.is_cuda:
+            torch.cuda.synchronize(tensor.device)
+
+    def _tic(self, tensor):
+        if not self.enable_timing:
+            return None
+        self._sync(tensor)
+        return time.perf_counter()
+
+    def _toc(self, timings, key, start, tensor=None):
+        if start is None:
+            return
+        self._sync(tensor)
+        timings[key] = timings.get(key, 0.0) + (time.perf_counter() - start) * 1000.0
 
     def _reset_parameters(self, feat_channels):
         super()._reset_parameters(feat_channels)
@@ -273,6 +294,7 @@ class SARStage1DEIMTransformer(DEIMTransformer):
         return content, enc_topk_bbox_unact, enc_topk_bboxes_list, enc_topk_logits_list, geo_outputs
 
     def forward(self, feats, targets=None):
+        timings = {}
         memory, spatial_shapes = self._get_encoder_input(feats)
         pixel_features = self.pixel_decoder(self._memory_to_feature_maps(memory, spatial_shapes))
 
@@ -293,6 +315,7 @@ class SARStage1DEIMTransformer(DEIMTransformer):
         init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list, geo_outputs = \
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
+        t0 = self._tic(memory)
         decoder_outputs = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
@@ -308,6 +331,7 @@ class SARStage1DEIMTransformer(DEIMTransformer):
             attn_mask=attn_mask,
             dn_meta=dn_meta,
             return_intermediate_queries=True)
+        self._toc(timings, 'decoder_forward', t0, memory)
         out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits, out_queries = decoder_outputs
 
         if self.training and dn_meta is not None:
@@ -320,7 +344,9 @@ class SARStage1DEIMTransformer(DEIMTransformer):
             dn_out_queries, out_queries = torch.split(out_queries, dn_meta['dn_num_split'], dim=2)
 
         final_queries = out_queries[-1]
+        t0 = self._tic(final_queries)
         pred_masks = self.mask_head(final_queries, pixel_features)
+        self._toc(timings, 'mask_projection', t0, pred_masks)
 
         if self.training:
             out = {
@@ -341,6 +367,9 @@ class SARStage1DEIMTransformer(DEIMTransformer):
             }
             if self.return_geometry:
                 out['geo_outputs'] = geo_outputs
+
+        if timings:
+            out['timings'] = timings
 
         if self.training and self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss2(

@@ -38,6 +38,16 @@ class SARStage1Criterion(DEIMCriterion):
             zero = self._zero_loss(outputs)
             return {'loss_mask_bce': zero, 'loss_mask_dice': zero}
 
+        for batch_idx, target in enumerate(targets):
+            num_labels = int(target['labels'].shape[0])
+            num_masks = int(target['masks'].shape[0])
+            if num_labels != num_masks:
+                raise ValueError(
+                    f"Mask/label count mismatch at batch index {batch_idx}: "
+                    f"{num_labels} labels but {num_masks} masks. "
+                    "Disable mask-unsafe augmentations or update them to transform masks."
+                )
+
         src_idx = self._get_src_permutation_idx(indices)
         src_masks = outputs['pred_masks'][src_idx]
         target_masks = torch.cat([
@@ -124,7 +134,8 @@ class SARStage1Criterion(DEIMCriterion):
             self.losses = requested_losses
 
         outputs_without_aux = {k: v for k, v in outputs.items() if 'aux' not in k}
-        indices = self.matcher(outputs_without_aux, targets, epoch=epoch)['indices']
+        indices = self.matcher(
+            outputs_without_aux, targets, epoch=epoch, step=kwargs.get('global_step', None))['indices']
 
         num_boxes = sum(len(t["labels"]) for t in targets)
         num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=outputs['pred_logits'].device)

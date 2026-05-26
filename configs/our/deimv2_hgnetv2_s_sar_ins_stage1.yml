@@ -41,6 +41,8 @@ DEIMv2_SAR_INS_STAGE1:
     mask_hidden_dim: 128
     use_weak_geometry: True
     return_geometry: True
+    enable_timing: True
+    timing_sync_cuda: False
 
 HGNetv2:
   name: 'B0'
@@ -57,9 +59,15 @@ HybridEncoder:
   version: 'dfine'
 
 SARInstancePostProcessor:
-  num_top_queries: 300
+  num_top_queries_bbox: 300
+  num_top_queries_segm: 100
   category_id_offset: 1
   return_geometry: False
+  debug: False
+  debug_dir: ./outputs/deimv2_hgnetv2_s_sar_ins_stage1/debug_val
+  debug_max_images: 5
+  enable_timing: True
+  timing_sync_cuda: False
 
 optimizer:
   type: AdamW
@@ -115,7 +123,7 @@ val_dataloader:
   total_batch_size: 4
   dataset:
     return_masks: True
-    return_weak_geometry: True
+    return_weak_geometry: False
     use_category2label: True
     transforms:
       ops:
@@ -144,9 +152,12 @@ SARStage1Criterion:
   reg_max: 32
   matcher:
     type: HungarianMatcher
-    weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 2}
+    weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 2, cost_mask_bce: 1.0, cost_mask_dice: 1.0}
     alpha: 0.25
     gamma: 2.0
+    mask_cost_downsample_size: 32
+    diagnostics: True
+    diagnostics_interval: 50
     change_matcher: True
     iou_order_alpha: 4.0
     matcher_change_epoch: 100

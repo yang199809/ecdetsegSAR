@@ -91,7 +91,7 @@ def test_weak_geometry():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default='configs/deimv2/deimv2_hgnetv2_s_sar_ins_stage1.yml')
+    parser.add_argument('--config', default='configs/our/deimv2_hgnetv2_s_sar_ins_stage1.yml')
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--size', type=int, default=128)
     args = parser.parse_args()
@@ -110,7 +110,14 @@ def main():
                 'num_layers': 2,
                 'dim_feedforward': 512,
                 'eval_idx': -1,
+                'enable_timing': True,
             }
+        },
+        SARInstancePostProcessor={
+            'num_top_queries_bbox': 20,
+            'num_top_queries_segm': 5,
+            'enable_timing': True,
+            'debug': False,
         },
         train_dataloader={'total_batch_size': 2},
         val_dataloader={'total_batch_size': 2},
@@ -131,13 +138,20 @@ def main():
         assert outputs['pred_logits'].shape[:2] == (2, 20)
         assert outputs['pred_boxes'].shape[:2] == (2, 20)
         assert outputs['pred_masks'].shape[:2] == (2, 20)
-        results = postprocessor(outputs, torch.tensor([[args.size, args.size]] * 2, device=device))
+        orig_size = torch.tensor([[args.size * 2, args.size + 16]] * 2, device=device)
+        results = postprocessor(outputs, orig_size, targets=targets)
         assert 'masks' in results[0]
         assert results[0]['masks'].ndim == 4
+        assert results[0]['scores'].numel() == 20
+        assert results[0]['mask_scores'].numel() == 5
+        assert results[0]['masks'].shape[0] == 5
+        assert results[0]['masks'].shape[-2:] == (args.size + 16, args.size * 2)
+        assert postprocessor.last_timing
+        assert 'timings' in outputs
 
     model.train()
     outputs = model(samples, targets=targets)
-    losses = criterion(outputs, targets, epoch=0)
+    losses = criterion(outputs, targets, epoch=0, global_step=0)
     assert_finite_losses(losses)
 
     print('SAR Stage-1 smoke test passed.')

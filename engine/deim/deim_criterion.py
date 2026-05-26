@@ -271,9 +271,10 @@ class DEIMCriterion(nn.Module):
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
         outputs_without_aux = {k: v for k, v in outputs.items() if 'aux' not in k}
+        matcher_kwargs = {'epoch': epoch, 'step': kwargs.get('global_step', None)}
 
         # Retrieve the matching between the outputs of the last layer and the targets
-        indices = self.matcher(outputs_without_aux, targets, epoch=epoch)['indices']
+        indices = self.matcher(outputs_without_aux, targets, **matcher_kwargs)['indices']
         self._clear_cache()
 
         # Get the matching union set across all decoder layers.
@@ -283,11 +284,11 @@ class DEIMCriterion(nn.Module):
             if 'pre_outputs' in outputs:
                 aux_outputs_list = outputs['aux_outputs'] + [outputs['pre_outputs']]
             for i, aux_outputs in enumerate(aux_outputs_list):
-                indices_aux = self.matcher(aux_outputs, targets, epoch=epoch)['indices']
+                indices_aux = self.matcher(aux_outputs, targets, **matcher_kwargs)['indices']
                 cached_indices.append(indices_aux)
                 indices_aux_list.append(indices_aux)
             for i, aux_outputs in enumerate(outputs['enc_aux_outputs']):
-                indices_enc = self.matcher(aux_outputs, targets, epoch=epoch)['indices']
+                indices_enc = self.matcher(aux_outputs, targets, **matcher_kwargs)['indices']
                 cached_indices_enc.append(indices_enc)
                 indices_aux_list.append(indices_enc)
             indices_go = self._get_go_indices(indices, indices_aux_list)

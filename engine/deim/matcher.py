@@ -15,6 +15,7 @@ from typing import Dict
 from .box_ops import box_cxcywh_to_xyxy, generalized_box_iou, box_iou
 
 from ..core import register
+from ..misc import dist_utils
 import numpy as np
 
 
@@ -30,7 +31,8 @@ class HungarianMatcher(nn.Module):
     __share__ = ['use_focal_loss', ]
 
     def __init__(self, weight_dict, use_focal_loss=False, alpha=0.25, gamma=2.0,
-                change_matcher=False, iou_order_alpha=1.0, matcher_change_epoch=10000):
+                change_matcher=False, iou_order_alpha=1.0, matcher_change_epoch=10000,
+                mask_cost_downsample_size=None, diagnostics=False, diagnostics_interval=100):
         """Creates the matcher
 
         Params:
@@ -42,6 +44,11 @@ class HungarianMatcher(nn.Module):
         self.cost_class = weight_dict['cost_class']
         self.cost_bbox = weight_dict['cost_bbox']
         self.cost_giou = weight_dict['cost_giou']
+        self.cost_mask_bce = weight_dict.get('cost_mask_bce', 0.0)
+        self.cost_mask_dice = weight_dict.get('cost_mask_dice', 0.0)
+        self.mask_cost_downsample_size = mask_cost_downsample_size
+        self.diagnostics = diagnostics
+        self.diagnostics_interval = int(diagnostics_interval)
 
         self.change_matcher = change_matcher
         self.iou_order_alpha = iou_order_alpha
@@ -53,10 +60,92 @@ class HungarianMatcher(nn.Module):
         self.alpha = alpha
         self.gamma = gamma
 
-        assert self.cost_class != 0 or self.cost_bbox != 0 or self.cost_giou != 0, "all costs cant be 0"
+        assert (self.cost_class != 0 or self.cost_bbox != 0 or self.cost_giou != 0 or
+                self.cost_mask_bce != 0 or self.cost_mask_dice != 0), "all costs cant be 0"
+
+    def _should_report(self, step):
+        if not self.diagnostics or not dist_utils.is_main_process():
+            return False
+        if step is None:
+            return True
+        return int(step) % max(self.diagnostics_interval, 1) == 0
+
+    def _compute_mask_cost(self, outputs, targets, step=None):
+        if ((self.cost_mask_bce == 0 and self.cost_mask_dice == 0) or
+                'pred_masks' not in outputs or
+                not all('masks' in target for target in targets)):
+            return None
+
+        pred_masks = outputs['pred_masks']
+        bs, num_queries, mask_h, mask_w = pred_masks.shape
+        if self.mask_cost_downsample_size is not None:
+            size = int(self.mask_cost_downsample_size)
+            pred_masks = F.interpolate(
+                pred_masks.flatten(0, 1)[:, None],
+                size=(size, size),
+                mode='bilinear',
+                align_corners=False,
+            )[:, 0].view(bs, num_queries, size, size)
+            mask_h = mask_w = size
+
+        target_masks = []
+        source_areas = []
+        downsampled_areas = []
+        for target in targets:
+            masks = target['masks'].to(device=pred_masks.device, dtype=pred_masks.dtype)
+            if masks.numel() == 0:
+                target_masks.append(masks.reshape(0, mask_h, mask_w))
+                continue
+            source_areas.append(masks.flatten(1).sum(1).detach())
+            masks = F.interpolate(masks[:, None], size=(mask_h, mask_w), mode='nearest')[:, 0]
+            target_masks.append(masks)
+            downsampled_areas.append(masks.flatten(1).sum(1).detach())
+
+        if target_masks:
+            target_masks = torch.cat(target_masks, dim=0)
+        else:
+            target_masks = pred_masks.new_zeros((0, mask_h, mask_w))
+        if target_masks.numel() == 0:
+            return pred_masks.new_zeros((bs * num_queries, 0))
+
+        if self._should_report(step) and source_areas and downsampled_areas:
+            source_areas_cat = torch.cat(source_areas).float()
+            down_areas_cat = torch.cat(downsampled_areas).float()
+            empty_frac = (down_areas_cat <= 0).float().mean().item()
+            print(
+                "[SARStage1][matcher] GT mask area before matching downsample "
+                f"mean={source_areas_cat.mean().item():.2f} "
+                f"min={source_areas_cat.min().item():.2f} "
+                f"max={source_areas_cat.max().item():.2f}; "
+                f"after downsample to {mask_h}x{mask_w} "
+                f"mean={down_areas_cat.mean().item():.2f} "
+                f"min={down_areas_cat.min().item():.2f} "
+                f"max={down_areas_cat.max().item():.2f}; "
+                f"empty_fraction={empty_frac:.4f}"
+            )
+
+        pred_flat = pred_masks.flatten(0, 1).flatten(1)
+        target_flat = target_masks.flatten(1)
+        num_pixels = float(pred_flat.shape[-1])
+
+        total_cost = pred_flat.new_zeros((pred_flat.shape[0], target_flat.shape[0]))
+        if self.cost_mask_bce != 0:
+            # Mean BCEWithLogits over pixels without materializing [queries, gt, pixels].
+            positive_part = (F.relu(pred_flat) + F.softplus(-pred_flat.abs())).mean(1, keepdim=True)
+            cost_bce = positive_part - torch.matmul(pred_flat, target_flat.transpose(0, 1)) / num_pixels
+            total_cost = total_cost + self.cost_mask_bce * cost_bce
+
+        if self.cost_mask_dice != 0:
+            pred_prob = pred_flat.sigmoid()
+            numerator = 2 * torch.matmul(pred_prob, target_flat.transpose(0, 1))
+            denominator = pred_prob.sum(1, keepdim=True) + target_flat.sum(1).unsqueeze(0)
+            cost_dice = 1 - (numerator + 1) / (denominator + 1)
+            total_cost = total_cost + self.cost_mask_dice * cost_dice
+
+        return total_cost
 
     @torch.no_grad()
-    def forward(self, outputs: Dict[str, torch.Tensor], targets, return_topk=False, epoch=0):
+    def forward(self, outputs: Dict[str, torch.Tensor], targets, return_topk=False, epoch=0, step=None):
         """ Performs the matching
 
         Params:
@@ -119,6 +208,10 @@ class HungarianMatcher(nn.Module):
 
             # Final cost matrix 3 * self.cost_bbox + 2 * self.cost_class + self.cost_giou
             C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+
+        mask_cost = self._compute_mask_cost(outputs, targets, step=step)
+        if mask_cost is not None:
+            C = C + mask_cost
 
         C = C.view(bs, num_queries, -1).cpu()
 

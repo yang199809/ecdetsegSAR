@@ -34,7 +34,9 @@ class HungarianMatcher(nn.Module):
     def __init__(self, weight_dict, use_focal_loss=False, alpha=0.25, gamma=2.0,
                 change_matcher=False, iou_order_alpha=1.0, matcher_change_epoch=10000,
                 mask_cost_downsample_size=None, mask_cost_valid_area_eps=1e-6,
-                mask_point_sample_ratio=0, diagnostics=False, diagnostics_interval=100):
+                mask_point_sample_ratio=0, mask_min_sampled_points=256,
+                mask_max_sampled_points=1024, mask_gt_fg_sample_ratio=0.5,
+                diagnostics=False, diagnostics_interval=100):
         """Creates the matcher
 
         Params:
@@ -51,6 +53,9 @@ class HungarianMatcher(nn.Module):
         self.mask_cost_downsample_size = mask_cost_downsample_size
         self.mask_cost_valid_area_eps = float(mask_cost_valid_area_eps)
         self.mask_point_sample_ratio = int(mask_point_sample_ratio)
+        self.mask_min_sampled_points = int(mask_min_sampled_points)
+        self.mask_max_sampled_points = int(mask_max_sampled_points)
+        self.mask_gt_fg_sample_ratio = float(mask_gt_fg_sample_ratio)
         self.diagnostics = diagnostics
         self.diagnostics_interval = int(diagnostics_interval)
 
@@ -90,6 +95,124 @@ class HungarianMatcher(nn.Module):
         )
         return samples[:, 0, :, 0]
 
+    def _num_sample_points(self, mask_h, mask_w):
+        if self.mask_point_sample_ratio <= 0:
+            return 0
+        num_points = max(mask_h, (mask_h * mask_w) // self.mask_point_sample_ratio)
+        if self.mask_min_sampled_points > 0:
+            num_points = max(num_points, self.mask_min_sampled_points)
+        if self.mask_max_sampled_points > 0:
+            num_points = min(num_points, self.mask_max_sampled_points)
+        return int(max(1, num_points))
+
+    @staticmethod
+    def _sample_indices_as_points(indices, height, width, num_points):
+        choice = torch.randint(indices.shape[0], (num_points,), device=indices.device)
+        selected = indices[choice]
+        y = (selected[:, 0].float() + 0.5) / float(height)
+        x = (selected[:, 1].float() + 0.5) / float(width)
+        return torch.stack([x, y], dim=-1)
+
+    def _sample_gt_aware_points(self, mask, num_points):
+        height, width = mask.shape[-2:]
+        foreground = (mask > 0.5).nonzero(as_tuple=False)
+        if foreground.numel() == 0:
+            return torch.rand(num_points, 2, device=mask.device)
+
+        num_fg = int(round(num_points * self.mask_gt_fg_sample_ratio))
+        num_fg = min(num_points, max(1, num_fg))
+        num_bg = num_points - num_fg
+
+        points = [self._sample_indices_as_points(foreground, height, width, num_fg)]
+        if num_bg > 0:
+            background = (mask <= 0.5).nonzero(as_tuple=False)
+            if background.numel() > 0:
+                points.append(self._sample_indices_as_points(background, height, width, num_bg))
+            else:
+                points.append(torch.rand(num_bg, 2, device=mask.device))
+
+        points = torch.cat(points, dim=0)
+        order = torch.randperm(points.shape[0], device=points.device)
+        return points[order]
+
+    def _compute_gt_aware_mask_cost(self, pred_masks, targets, num_points, step=None):
+        bs, num_queries = pred_masks.shape[:2]
+        target_sizes = [int(target['masks'].shape[0]) for target in targets]
+        total_targets = sum(target_sizes)
+        total_cost = pred_masks.new_zeros((bs * num_queries, total_targets))
+
+        source_areas = []
+        sampled_areas = []
+        col_offset = 0
+        for batch_idx, (pred_per_image, target) in enumerate(zip(pred_masks, targets)):
+            masks = target['masks'].to(device=pred_masks.device, dtype=pred_masks.dtype)
+            num_targets = int(masks.shape[0])
+            if num_targets == 0:
+                continue
+
+            row_start = batch_idx * num_queries
+            row_end = row_start + num_queries
+            source_areas.append(masks.flatten(1).sum(1).detach())
+            cols = []
+            for mask in masks:
+                if mask.sum() <= self.mask_cost_valid_area_eps:
+                    cols.append(pred_per_image.new_zeros(num_queries))
+                    sampled_areas.append(mask.new_zeros(()))
+                    continue
+
+                # Use target-specific foreground/background points. Full-image random
+                # points miss tiny SAR ships too often and make mask matching vanish.
+                point_coords = self._sample_gt_aware_points(mask, num_points)
+                pred_points = self._point_sample(
+                    pred_per_image,
+                    point_coords.unsqueeze(0).repeat(num_queries, 1, 1),
+                )
+                target_points = self._point_sample(
+                    mask.unsqueeze(0),
+                    point_coords.unsqueeze(0),
+                    mode='nearest',
+                )[0].clamp_(0, 1)
+                sampled_areas.append(target_points.detach().sum())
+
+                cost = pred_per_image.new_zeros(num_queries)
+                if self.cost_mask_bce != 0:
+                    stable_bce = F.relu(pred_points) + F.softplus(-pred_points.abs())
+                    cost_bce = stable_bce.mean(1) - (pred_points * target_points.unsqueeze(0)).mean(1)
+                    cost = cost + self.cost_mask_bce * cost_bce
+
+                if self.cost_mask_dice != 0:
+                    pred_prob = pred_points.sigmoid()
+                    numerator = 2 * (pred_prob * target_points.unsqueeze(0)).sum(1)
+                    denominator = pred_prob.sum(1) + target_points.sum()
+                    cost_dice = 1 - (numerator + 1) / (denominator + 1)
+                    cost = cost + self.cost_mask_dice * cost_dice
+
+                cols.append(cost)
+
+            total_cost[row_start:row_end, col_offset:col_offset + num_targets] = torch.stack(cols, dim=1)
+            col_offset += num_targets
+
+        if self._should_report(step) and source_areas:
+            source_areas_cat = torch.cat(source_areas).float()
+            sampled_areas_cat = torch.stack(sampled_areas).float()
+            source_empty_frac = (source_areas_cat <= self.mask_cost_valid_area_eps).float().mean().item()
+            sampled_empty_frac = (sampled_areas_cat <= self.mask_cost_valid_area_eps).float().mean().item()
+            print(
+                "[SARStage1][matcher] GT-aware mask point sampling "
+                f"source_area mean={source_areas_cat.mean().item():.2f} "
+                f"min={source_areas_cat.min().item():.2f} "
+                f"max={source_areas_cat.max().item():.2f}; "
+                f"source_empty_fraction={source_empty_frac:.4f}; "
+                f"sampled_points={num_points}; "
+                f"foreground_ratio={self.mask_gt_fg_sample_ratio:.2f}; "
+                f"sampled_positive_count mean={sampled_areas_cat.mean().item():.2f} "
+                f"min={sampled_areas_cat.min().item():.2f} "
+                f"max={sampled_areas_cat.max().item():.2f}; "
+                f"sampled_empty_fraction={sampled_empty_frac:.4f}"
+            )
+
+        return total_cost
+
     def _compute_mask_cost(self, outputs, targets, step=None):
         if ((self.cost_mask_bce == 0 and self.cost_mask_dice == 0) or
                 'pred_masks' not in outputs or
@@ -99,72 +222,34 @@ class HungarianMatcher(nn.Module):
         pred_masks = self._materialize_pred_masks(outputs['pred_masks'])
         bs, num_queries, mask_h, mask_w = pred_masks.shape
 
-        target_masks = []
-        source_areas = []
-        for target in targets:
-            masks = target['masks'].to(device=pred_masks.device, dtype=pred_masks.dtype)
-            if masks.numel() == 0:
-                target_masks.append(masks)
-                continue
-            source_areas.append(masks.flatten(1).sum(1).detach())
-            target_masks.append(masks)
-
-        if target_masks:
-            target_masks = torch.cat(target_masks, dim=0)
-        else:
-            target_masks = pred_masks.new_zeros((0, mask_h, mask_w))
-        if target_masks.numel() == 0:
+        if sum(int(target['masks'].shape[0]) for target in targets) == 0:
             return pred_masks.new_zeros((bs * num_queries, 0))
 
-        valid_target = target_masks.flatten(1).sum(1) > self.mask_cost_valid_area_eps
         if self.mask_point_sample_ratio > 0:
-            # EdgeCrafter-style normalized point sampling keeps GT masks at their
-            # transformed image resolution instead of forcing them to 64x64/100x100.
-            num_points = max(mask_h, (mask_h * mask_w) // self.mask_point_sample_ratio)
-            point_coords = torch.rand(1, num_points, 2, device=pred_masks.device)
-            pred_flat = self._point_sample(
-                pred_masks.flatten(0, 1),
-                point_coords.repeat(bs * num_queries, 1, 1),
-            )
-            target_flat = self._point_sample(
-                target_masks,
-                point_coords.repeat(target_masks.shape[0], 1, 1),
-                mode='nearest',
-            )
-            if self._should_report(step) and source_areas:
-                source_areas_cat = torch.cat(source_areas).float()
-                sampled_areas = target_flat.detach().sum(1).float()
-                source_empty_frac = (source_areas_cat <= self.mask_cost_valid_area_eps).float().mean().item()
-                sampled_empty_frac = (sampled_areas <= self.mask_cost_valid_area_eps).float().mean().item()
-                print(
-                    "[SARStage1][matcher] GT mask area before point sampling "
-                    f"mean={source_areas_cat.mean().item():.2f} "
-                    f"min={source_areas_cat.min().item():.2f} "
-                    f"max={source_areas_cat.max().item():.2f}; "
-                    f"source_empty_fraction={source_empty_frac:.4f}; "
-                    f"sampled_points={num_points}; "
-                    f"sampled_positive_count mean={sampled_areas.mean().item():.2f} "
-                    f"min={sampled_areas.min().item():.2f} "
-                    f"max={sampled_areas.max().item():.2f}; "
-                    f"sampled_empty_fraction={sampled_empty_frac:.4f}"
-                )
-        else:
-            if self.mask_cost_downsample_size is not None:
-                size = int(self.mask_cost_downsample_size)
-                pred_masks = F.interpolate(
-                    pred_masks.flatten(0, 1)[:, None],
-                    size=(size, size),
-                    mode='bilinear',
-                    align_corners=False,
-                )[:, 0].view(bs, num_queries, size, size)
-                mask_h = mask_w = size
-                target_masks = F.interpolate(
-                    target_masks[:, None].float(),
-                    size=(mask_h, mask_w),
-                    mode='area',
-                )[:, 0].clamp_(0, 1)
-            pred_flat = pred_masks.flatten(0, 1).flatten(1)
-            target_flat = target_masks.flatten(1)
+            return self._compute_gt_aware_mask_cost(
+                pred_masks, targets, self._num_sample_points(mask_h, mask_w), step=step)
+
+        target_masks = torch.cat([
+            target['masks'].to(device=pred_masks.device, dtype=pred_masks.dtype)
+            for target in targets
+        ], dim=0)
+        valid_target = target_masks.flatten(1).sum(1) > self.mask_cost_valid_area_eps
+        if self.mask_cost_downsample_size is not None:
+            size = int(self.mask_cost_downsample_size)
+            pred_masks = F.interpolate(
+                pred_masks.flatten(0, 1)[:, None],
+                size=(size, size),
+                mode='bilinear',
+                align_corners=False,
+            )[:, 0].view(bs, num_queries, size, size)
+            mask_h = mask_w = size
+            target_masks = F.interpolate(
+                target_masks[:, None].float(),
+                size=(mask_h, mask_w),
+                mode='area',
+            )[:, 0].clamp_(0, 1)
+        pred_flat = pred_masks.flatten(0, 1).flatten(1)
+        target_flat = target_masks.flatten(1)
         num_pixels = float(pred_flat.shape[-1])
 
         total_cost = pred_flat.new_zeros((pred_flat.shape[0], target_flat.shape[0]))

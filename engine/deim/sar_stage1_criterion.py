@@ -21,13 +21,19 @@ class SARStage1Criterion(DEIMCriterion):
 
     def __init__(self, *args, mask_diagnostics=False, mask_diagnostics_interval=100,
                  mask_point_sample_ratio=0, oversample_ratio=3.0,
-                 importance_sample_ratio=0.75, **kwargs):
+                 importance_sample_ratio=0.75, mask_gt_sample_ratio=0.5,
+                 mask_gt_fg_sample_ratio=0.75, mask_min_sampled_points=256,
+                 mask_max_sampled_points=1024, **kwargs):
         super().__init__(*args, **kwargs)
         self.mask_diagnostics = mask_diagnostics
         self.mask_diagnostics_interval = int(mask_diagnostics_interval)
         self.mask_point_sample_ratio = int(mask_point_sample_ratio)
         self.oversample_ratio = float(oversample_ratio)
         self.importance_sample_ratio = float(importance_sample_ratio)
+        self.mask_gt_sample_ratio = float(mask_gt_sample_ratio)
+        self.mask_gt_fg_sample_ratio = float(mask_gt_fg_sample_ratio)
+        self.mask_min_sampled_points = int(mask_min_sampled_points)
+        self.mask_max_sampled_points = int(mask_max_sampled_points)
 
     def _zero_loss(self, outputs):
         return outputs['pred_logits'].sum() * 0.0
@@ -70,13 +76,53 @@ class SARStage1Criterion(DEIMCriterion):
         )
         return samples[:, 0, :, 0]
 
-    def _sample_points(self, logits):
-        if self.mask_point_sample_ratio <= 0:
-            return None
-        num_masks, height, width = logits.shape
-        if num_masks == 0:
-            return None
+    def _num_sample_points(self, height, width):
         num_points = max(1, (height * width) // self.mask_point_sample_ratio)
+        if self.mask_min_sampled_points > 0:
+            num_points = max(num_points, self.mask_min_sampled_points)
+        if self.mask_max_sampled_points > 0:
+            num_points = min(num_points, self.mask_max_sampled_points)
+        return int(max(1, num_points))
+
+    @staticmethod
+    def _sample_indices_as_points(indices, height, width, num_points):
+        choice = torch.randint(indices.shape[0], (num_points,), device=indices.device)
+        selected = indices[choice]
+        y = (selected[:, 0].float() + 0.5) / float(height)
+        x = (selected[:, 1].float() + 0.5) / float(width)
+        return torch.stack([x, y], dim=-1)
+
+    def _sample_gt_aware_points(self, mask, num_points):
+        height, width = mask.shape[-2:]
+        foreground = (mask > 0.5).nonzero(as_tuple=False)
+        if foreground.numel() == 0:
+            return torch.rand(num_points, 2, device=mask.device)
+
+        num_fg = int(round(num_points * self.mask_gt_fg_sample_ratio))
+        num_fg = min(num_points, max(1, num_fg))
+        num_bg = num_points - num_fg
+
+        points = [self._sample_indices_as_points(foreground, height, width, num_fg)]
+        if num_bg > 0:
+            background = (mask <= 0.5).nonzero(as_tuple=False)
+            if background.numel() > 0:
+                points.append(self._sample_indices_as_points(background, height, width, num_bg))
+            else:
+                points.append(torch.rand(num_bg, 2, device=mask.device))
+
+        points = torch.cat(points, dim=0)
+        order = torch.randperm(points.shape[0], device=points.device)
+        return points[order]
+
+    def _sample_gt_aware_points_batch(self, target_masks, num_points):
+        return torch.stack([
+            self._sample_gt_aware_points(mask, num_points) for mask in target_masks
+        ], dim=0)
+
+    def _sample_uncertain_points(self, logits, num_points):
+        if num_points <= 0:
+            return None
+        num_masks = logits.shape[0]
         num_sampled = max(num_points, int(num_points * self.oversample_ratio))
         point_coords = torch.rand(num_masks, num_sampled, 2, device=logits.device)
         with torch.no_grad():
@@ -90,6 +136,30 @@ class SARStage1Criterion(DEIMCriterion):
                 random_coords = torch.rand(num_masks, num_random, 2, device=logits.device)
                 return torch.cat([uncertain_coords, random_coords], dim=1)
             return uncertain_coords
+
+    def _sample_points(self, logits, target_masks=None):
+        if self.mask_point_sample_ratio <= 0:
+            return None
+        num_masks, height, width = logits.shape
+        if num_masks == 0:
+            return None
+        num_points = self._num_sample_points(height, width)
+
+        gt_points = None
+        num_gt_points = 0
+        if target_masks is not None and self.mask_gt_sample_ratio > 0:
+            num_gt_points = min(num_points, max(1, int(round(num_points * self.mask_gt_sample_ratio))))
+            # Reserve a stable portion of loss samples for GT foreground/background.
+            # This keeps tiny SAR ships visible even when uncertainty sampling would
+            # otherwise select mostly background points early in training.
+            gt_points = self._sample_gt_aware_points_batch(target_masks, num_gt_points)
+
+        uncertain_points = self._sample_uncertain_points(logits, num_points - num_gt_points)
+        if gt_points is None:
+            return uncertain_points
+        if uncertain_points is None:
+            return gt_points
+        return torch.cat([gt_points, uncertain_points], dim=1)
 
     def _report_mask_resize_diagnostics(self, source_masks, resized_masks, resolution, step=None,
                                         branch='final', pred_masks=None):
@@ -128,10 +198,20 @@ class SARStage1Criterion(DEIMCriterion):
         for name, keep in groups:
             if keep.any():
                 missing = (resized_areas[keep] <= 0).float().mean().item()
+                valid = keep & (resized_areas > 0)
+                if valid.any():
+                    dice_value = f"{dice[valid].mean().item():.4f}"
+                    iou_value = f"{iou[valid].mean().item():.4f}"
+                    valid_n = int(valid.sum().item())
+                else:
+                    dice_value = "nan"
+                    iou_value = "nan"
+                    valid_n = 0
                 parts.append(
                     f"{name}:n={int(keep.sum().item())},"
-                    f"dice={dice[keep].mean().item():.4f},"
-                    f"iou={iou[keep].mean().item():.4f},"
+                    f"valid_n={valid_n},"
+                    f"dice={dice_value},"
+                    f"iou={iou_value},"
                     f"missing={missing:.4f}"
                 )
         if parts:
@@ -181,7 +261,7 @@ class SARStage1Criterion(DEIMCriterion):
                 pred_masks=src_masks,
             )
 
-        point_coords = self._sample_points(src_masks)
+        point_coords = self._sample_points(src_masks, source_masks)
         if point_coords is not None:
             # Sample GT masks at their native training resolution. This avoids erasing
             # tiny SAR ship masks by first resizing them down to pred_masks resolution.

@@ -13,6 +13,8 @@ Key switches:
 - `use_mask_aux_loss`: adds mask BCE/Dice to decoder auxiliary outputs.
 - `use_sparse_mask_train`: optional memory-saving sparse mask path; disabled by default for the stable Stage-1 loop.
 - `mask_point_sample_ratio`: enables point-sampled mask BCE/Dice and mask matching. GT masks are sampled at their transformed image resolution rather than being downsampled before loss/matching.
+- `mask_gt_sample_ratio` / `mask_gt_fg_sample_ratio`: reserve loss samples for GT-aware foreground/background points so tiny SAR ships remain visible during early training.
+- `mask_min_sampled_points` / `mask_max_sampled_points`: bound the point count used by mask loss and matching.
 - `use_weak_geometry` / `return_weak_geometry`: optional later ablation path; both are disabled by default.
 
 ## Training
@@ -42,7 +44,7 @@ The evaluator reports both `bbox` AP and `segm` AP when `iou_types: ['bbox', 'se
 
 ## Diagnostics
 
-The matcher reports GT mask area before and after matching downsampling, plus empty-mask fraction. The criterion reports the same statistics at the actual `pred_masks` training resolution and prints matched Dice/IoU grouped by small, medium, and large mask area. The postprocessor can save up to `debug_max_images` validation visualizations through:
+The matcher reports GT-aware sampled foreground counts and empty-sample fraction. The criterion reports mask-area statistics at the actual `pred_masks` training resolution and prints matched Dice/IoU grouped by small, medium, and large mask area. Masks that disappear after resizing are counted as `missing` and are excluded from the Dice/IoU mean so the diagnostic does not report a false perfect score for empty targets. The postprocessor can save up to `debug_max_images` validation visualizations through:
 
 ```yaml
 SARInstancePostProcessor:

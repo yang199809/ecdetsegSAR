@@ -156,6 +156,10 @@ SARStage1Criterion:
   mask_point_sample_ratio: 16
   oversample_ratio: 3.0
   importance_sample_ratio: 0.75
+  mask_gt_sample_ratio: 0.5
+  mask_gt_fg_sample_ratio: 0.75
+  mask_min_sampled_points: 256
+  mask_max_sampled_points: 1024
   matcher:
     type: HungarianMatcher
     weight_dict: {cost_class: 2, cost_bbox: 1, cost_giou: 1, cost_mask_bce: 1.0, cost_mask_dice: 1.0}
@@ -163,6 +167,9 @@ SARStage1Criterion:
     gamma: 2.0
     mask_cost_downsample_size: ~
     mask_point_sample_ratio: 16
+    mask_min_sampled_points: 256
+    mask_max_sampled_points: 1024
+    mask_gt_fg_sample_ratio: 0.5
     mask_cost_valid_area_eps: 1.0e-6
     diagnostics: True
     diagnostics_interval: 50

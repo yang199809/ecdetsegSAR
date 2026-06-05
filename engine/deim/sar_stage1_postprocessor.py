@@ -215,6 +215,12 @@ class SARInstancePostProcessor(nn.Module):
                 result['mask_labels'] = mask_labels[batch_idx]
                 result['mask_boxes'] = mask_boxes[batch_idx]
                 result['mask_scores'] = mask_scores[batch_idx]
+                if (result['masks'].shape[0] != result['mask_scores'].numel() or
+                        result['masks'].shape[0] != result['mask_labels'].numel()):
+                    raise ValueError(
+                        "Segmentation postprocess produced inconsistent mask, score, "
+                        "and label counts."
+                    )
                 if targets is not None:
                     self._save_debug_visualization(result, targets[batch_idx], int(width), int(height))
 

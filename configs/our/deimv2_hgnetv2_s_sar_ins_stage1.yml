@@ -160,6 +160,7 @@ SARStage1Criterion:
   mask_gt_fg_sample_ratio: 0.75
   mask_min_sampled_points: 256
   mask_max_sampled_points: 1024
+  use_mask_cost_in_matching: True
   matcher:
     type: HungarianMatcher
     weight_dict: {cost_class: 2, cost_bbox: 1, cost_giou: 1, cost_mask_bce: 1.0, cost_mask_dice: 1.0}

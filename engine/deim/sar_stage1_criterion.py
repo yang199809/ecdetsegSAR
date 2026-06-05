@@ -1,8 +1,9 @@
 """
 Stage-1 SAR instance segmentation criterion.
 
-Detection losses and Hungarian matching stay identical to DEIMv2. Mask and weak
-geometry losses are added only for final matched positive object queries.
+Stage 1 uses the DEIMv2 detection losses and adds mask losses only for matched
+positive object queries. By default the shared Hungarian matcher is mask-aware,
+so final and auxiliary detection/mask losses use the same assignment policy.
 """
 
 import torch
@@ -23,7 +24,7 @@ class SARStage1Criterion(DEIMCriterion):
                  mask_point_sample_ratio=0, oversample_ratio=3.0,
                  importance_sample_ratio=0.75, mask_gt_sample_ratio=0.5,
                  mask_gt_fg_sample_ratio=0.75, mask_min_sampled_points=256,
-                 mask_max_sampled_points=1024, **kwargs):
+                 mask_max_sampled_points=1024, use_mask_cost_in_matching=True, **kwargs):
         super().__init__(*args, **kwargs)
         self.mask_diagnostics = mask_diagnostics
         self.mask_diagnostics_interval = int(mask_diagnostics_interval)
@@ -34,6 +35,7 @@ class SARStage1Criterion(DEIMCriterion):
         self.mask_gt_fg_sample_ratio = float(mask_gt_fg_sample_ratio)
         self.mask_min_sampled_points = int(mask_min_sampled_points)
         self.mask_max_sampled_points = int(mask_max_sampled_points)
+        self.use_mask_cost_in_matching = bool(use_mask_cost_in_matching)
 
     def _zero_loss(self, outputs):
         return outputs['pred_logits'].sum() * 0.0
@@ -64,6 +66,19 @@ class SARStage1Criterion(DEIMCriterion):
         if isinstance(pred_masks, dict):
             return SARSegmentationHead.materialize_matched(pred_masks, src_idx)
         return pred_masks[src_idx]
+
+    def _matcher_view(self, outputs):
+        if self.use_mask_cost_in_matching:
+            return outputs
+        if isinstance(outputs, dict):
+            return {
+                key: self._matcher_view(value)
+                for key, value in outputs.items()
+                if key != 'pred_masks'
+            }
+        if isinstance(outputs, list):
+            return [self._matcher_view(value) for value in outputs]
+        return outputs
 
     @staticmethod
     def _point_sample(masks, point_coords, mode='bilinear'):
@@ -338,16 +353,21 @@ class SARStage1Criterion(DEIMCriterion):
     def forward(self, outputs, targets, epoch=0, **kwargs):
         requested_losses = list(self.losses)
         det_losses = [loss for loss in requested_losses if loss not in self.CUSTOM_LOSSES]
+        matcher_outputs = self._matcher_view(outputs)
 
         try:
             self.losses = det_losses
-            losses = super().forward(outputs, targets, epoch=epoch, **kwargs)
+            losses = super().forward(matcher_outputs, targets, epoch=epoch, **kwargs)
         finally:
             self.losses = requested_losses
 
         outputs_without_aux = {k: v for k, v in outputs.items() if 'aux' not in k}
         indices = self.matcher(
-            outputs_without_aux, targets, epoch=epoch, step=kwargs.get('global_step', None))['indices']
+            self._matcher_view(outputs_without_aux),
+            targets,
+            epoch=epoch,
+            step=kwargs.get('global_step', None),
+        )['indices']
 
         num_boxes = sum(len(t["labels"]) for t in targets)
         num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=outputs['pred_logits'].device)
@@ -365,7 +385,11 @@ class SARStage1Criterion(DEIMCriterion):
                     if 'pred_masks' not in aux_outputs:
                         continue
                     aux_indices = self.matcher(
-                        aux_outputs, targets, epoch=epoch, step=global_step)['indices']
+                        self._matcher_view(aux_outputs),
+                        targets,
+                        epoch=epoch,
+                        step=global_step,
+                    )['indices']
                     aux_losses = self.loss_masks(
                         aux_outputs,
                         targets,
@@ -388,4 +412,6 @@ class SARStage1Criterion(DEIMCriterion):
                 key, self.weight_dict.get(base_key, 1.0))
         custom_losses = weighted_custom_losses
         losses.update(custom_losses)
+        if 'local' in requested_losses and 'loss_ddf' not in losses:
+            losses['loss_ddf'] = self._zero_loss(outputs)
         return {k: torch.nan_to_num(v, nan=0.0) for k, v in losses.items()}

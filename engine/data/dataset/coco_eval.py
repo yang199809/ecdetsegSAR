@@ -130,6 +130,12 @@ class CocoEvaluator(object):
 
             scores_tensor = prediction.get("mask_scores", prediction["scores"])
             labels_tensor = prediction.get("mask_labels", prediction["labels"])
+            if masks.shape[0] != scores_tensor.numel() or masks.shape[0] != labels_tensor.numel():
+                raise ValueError(
+                    "COCO segmentation prediction count mismatch: "
+                    f"{masks.shape[0]} masks, {scores_tensor.numel()} scores, "
+                    f"{labels_tensor.numel()} labels for image_id={original_id}."
+                )
             scores = scores_tensor.detach().cpu().tolist()
             labels = labels_tensor.detach().cpu().tolist()
 

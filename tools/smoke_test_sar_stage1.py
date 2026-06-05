@@ -14,6 +14,7 @@ sys.path.insert(0, REPO_ROOT)
 
 import engine  # noqa: F401
 from engine.core import YAMLConfig
+from engine.data.dataset.coco_eval import CocoEvaluator
 
 
 def make_elongated_mask(height, width, x0, y0, x1, y1):
@@ -59,6 +60,8 @@ def assert_finite_losses(losses):
         'loss_mal',
         'loss_bbox',
         'loss_giou',
+        'loss_fgl',
+        'loss_ddf',
         'loss_mask_bce',
         'loss_mask_dice',
     }
@@ -133,17 +136,27 @@ def main():
         assert results[0]['masks'].ndim == 4
         assert results[0]['scores'].numel() == 20
         assert results[0]['mask_scores'].numel() == 5
+        assert results[0]['mask_labels'].numel() == 5
         assert results[0]['masks'].shape[0] == 5
         assert results[0]['masks'].shape[-2:] == (args.size + 16, args.size * 2)
         assert postprocessor.last_timing
         assert 'timings' in outputs
+        evaluator = object.__new__(CocoEvaluator)
+        evaluator.last_timing = {}
+        segm_predictions = {int(targets[i]['image_id'].item()): result for i, result in enumerate(results)}
+        segm_results = evaluator.prepare_for_coco_segmentation(segm_predictions)
+        assert len(segm_results) == 2 * 5
+        assert evaluator.last_timing
 
     model.train()
     outputs = model(samples, targets=targets)
+    assert 'aux_outputs' in outputs
+    assert all('pred_masks' in aux for aux in outputs['aux_outputs'])
     assert outputs['aux_outputs'][0]['pred_masks'].shape[:2] == (2, 20)
     losses = criterion(outputs, targets, epoch=0, global_step=0)
     assert 'loss_mask_bce_aux_0' in losses
     assert 'loss_mask_dice_aux_0' in losses
+    assert any(name.startswith('loss_ddf') for name in losses)
     assert_finite_losses(losses)
 
     det_cfg = YAMLConfig(

@@ -25,9 +25,6 @@ from .sar_segmentation_head import SARSegmentationHead
 from .sar_stage1 import (
     DEIMv2_SAR_INS_STAGE1,
     SARStage1DEIMTransformer,
-    WeakGeometryQueryInit,
-    LightweightPixelDecoder,
-    QueryBasedMaskHead,
 )
 from .sar_stage1_criterion import SARStage1Criterion
 from .sar_stage1_postprocessor import SARInstancePostProcessor

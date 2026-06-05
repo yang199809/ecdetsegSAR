@@ -3,11 +3,9 @@ Minimal Stage-1 SAR instance segmentation extension for DEIMv2.
 """
 
 import time
-from collections import OrderedDict
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.nn.init as init
 
 from ..core import register
@@ -38,103 +36,6 @@ class DEIMv2_SAR_INS_STAGE1(nn.Module):
             if hasattr(m, 'convert_to_deploy'):
                 m.convert_to_deploy()
         return self
-
-
-class ConvBlock(nn.Module):
-    def __init__(self, channels, act_layer=nn.SiLU):
-        super().__init__()
-        self.block = nn.Sequential(OrderedDict([
-            ('conv', nn.Conv2d(channels, channels, 3, padding=1, bias=False)),
-            ('norm', nn.BatchNorm2d(channels)),
-            ('act', act_layer(inplace=True)),
-        ]))
-
-    def forward(self, x):
-        return self.block(x)
-
-
-@register()
-class LightweightPixelDecoder(nn.Module):
-    """Small FPN-like mask feature decoder."""
-
-    def __init__(self, in_channels=256, mask_dim=128, num_levels=3):
-        super().__init__()
-        self.lateral_convs = nn.ModuleList([
-            nn.Conv2d(in_channels, mask_dim, 1) for _ in range(num_levels)
-        ])
-        self.output_convs = nn.Sequential(
-            ConvBlock(mask_dim),
-            ConvBlock(mask_dim),
-        )
-
-    def forward(self, feats):
-        feats = feats[:len(self.lateral_convs)]
-        laterals = [proj(feat) for proj, feat in zip(self.lateral_convs, feats)]
-        out = laterals[-1]
-        for lateral in reversed(laterals[:-1]):
-            out = F.interpolate(out, size=lateral.shape[-2:], mode='nearest') + lateral
-        return self.output_convs(out)
-
-
-@register()
-class QueryBasedMaskHead(nn.Module):
-    """Dot-product query mask head."""
-
-    def __init__(self, hidden_dim=256, mask_dim=128):
-        super().__init__()
-        self.query_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(inplace=True),
-            nn.Linear(hidden_dim, mask_dim),
-        )
-        self.scale = mask_dim ** -0.5
-
-    def forward(self, queries, pixel_features):
-        mask_embed = self.query_proj(queries)
-        return torch.einsum('bqc,bchw->bqhw', mask_embed, pixel_features) * self.scale
-
-
-@register()
-class WeakGeometryQueryInit(nn.Module):
-    """Inject latent mask-derived geometry predictions into initial queries."""
-
-    def __init__(self, hidden_dim=256, act_layer=nn.SiLU):
-        super().__init__()
-        self.pred_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            act_layer(inplace=True),
-            nn.Linear(hidden_dim, 7),
-        )
-        self.geo_embed = nn.Sequential(
-            nn.Linear(7, hidden_dim),
-            act_layer(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.gate = nn.Sequential(
-            nn.Linear(hidden_dim + 7, hidden_dim),
-            act_layer(inplace=True),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, queries, pos_embed=None, reference_boxes=None):
-        src = queries if pos_embed is None else queries + pos_embed
-        raw = self.pred_head(src)
-        center = raw[..., 0:2].sigmoid()
-        scale = raw[..., 2:4].sigmoid()
-        direction = F.normalize(raw[..., 4:6], p=2, dim=-1, eps=1e-6)
-        anisotropy = raw[..., 6:7].sigmoid()
-
-        geo = torch.cat([center, scale, direction, anisotropy], dim=-1)
-        alpha = self.gate(torch.cat([src, geo], dim=-1)).sigmoid()
-        enhanced = queries + alpha * self.geo_embed(geo)
-
-        return enhanced, {
-            'pred_center': center,
-            'pred_scale': scale,
-            'pred_dir': direction,
-            'pred_anisotropy': anisotropy,
-            'geo_alpha': alpha,
-        }
 
 
 @register()
@@ -176,8 +77,8 @@ class SARStage1DEIMTransformer(DEIMTransformer):
                  mask_num_blocks=None,
                  use_mask_aux_loss=True,
                  use_sparse_mask_train=False,
-                 use_weak_geometry=True,
-                 return_geometry=True,
+                 use_weak_geometry=False,
+                 return_geometry=False,
                  enable_timing=False,
                  timing_sync_cuda=False):
         super().__init__(
@@ -216,8 +117,13 @@ class SARStage1DEIMTransformer(DEIMTransformer):
         self.mask_base_stride = min(feat_strides[:num_levels])
         self.use_mask_aux_loss = use_mask_aux_loss
         self.use_sparse_mask_train = use_sparse_mask_train
-        self.use_weak_geometry = use_weak_geometry
-        self.return_geometry = return_geometry
+        if use_weak_geometry:
+            raise ValueError(
+                "Stage 1 keeps weak geometry disabled; use SARSegmentationHead-only "
+                "query-pixel masks for the baseline."
+            )
+        self.use_weak_geometry = False
+        self.return_geometry = bool(return_geometry)
         self.enable_timing = enable_timing
         self.timing_sync_cuda = timing_sync_cuda
         self.mask_head = SARSegmentationHead(
@@ -227,30 +133,6 @@ class SARStage1DEIMTransformer(DEIMTransformer):
             mask_output_stride=self.mask_output_stride,
             use_sparse_train=use_sparse_mask_train,
         )
-        self.weak_geometry_init = WeakGeometryQueryInit(hidden_dim) if use_weak_geometry else None
-
-    def _build_mask_refine(self, mask_hidden_dim):
-        """Optionally refine the stride-8 mask feature to a higher spatial resolution."""
-        if self.mask_output_stride == self.mask_base_stride:
-            return nn.Identity()
-        if self.mask_output_stride < self.mask_base_stride:
-            if self.mask_base_stride % self.mask_output_stride != 0:
-                raise ValueError(
-                    f"mask_output_stride={self.mask_output_stride} must divide "
-                    f"the base mask stride {self.mask_base_stride}"
-                )
-            scale_factor = self.mask_base_stride // self.mask_output_stride
-            return nn.Sequential(
-                nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=False),
-                ConvBlock(mask_hidden_dim),
-            )
-        if self.mask_output_stride % self.mask_base_stride != 0:
-            raise ValueError(
-                f"mask_output_stride={self.mask_output_stride} must be a multiple of "
-                f"the base mask stride {self.mask_base_stride}"
-            )
-        scale_factor = self.mask_output_stride // self.mask_base_stride
-        return nn.AvgPool2d(kernel_size=scale_factor, stride=scale_factor)
 
     def _sync(self, tensor):
         if self.timing_sync_cuda and torch.is_tensor(tensor) and tensor.is_cuda:
@@ -270,18 +152,6 @@ class SARStage1DEIMTransformer(DEIMTransformer):
 
     def _reset_parameters(self, feat_channels):
         super()._reset_parameters(feat_channels)
-        if hasattr(self, 'pixel_decoder'):
-            for module in self.pixel_decoder.modules():
-                if isinstance(module, nn.Conv2d):
-                    init.xavier_uniform_(module.weight)
-                    if module.bias is not None:
-                        init.constant_(module.bias, 0)
-        if hasattr(self, 'mask_refine'):
-            for module in self.mask_refine.modules():
-                if isinstance(module, nn.Conv2d):
-                    init.xavier_uniform_(module.weight)
-                    if module.bias is not None:
-                        init.constant_(module.bias, 0)
         if hasattr(self, 'mask_head'):
             for module in self.mask_head.modules():
                 if isinstance(module, (nn.Conv2d, nn.Linear)):
@@ -327,20 +197,13 @@ class SARStage1DEIMTransformer(DEIMTransformer):
         else:
             content = enc_topk_memory.detach()
 
-        geo_outputs = {}
-        if self.weak_geometry_init is not None:
-            content, geo_outputs = self.weak_geometry_init(
-                content,
-                reference_boxes=F.sigmoid(enc_topk_bbox_unact.detach()),
-            )
-
         enc_topk_bbox_unact = enc_topk_bbox_unact.detach()
 
         if denoising_bbox_unact is not None:
             enc_topk_bbox_unact = torch.concat([denoising_bbox_unact, enc_topk_bbox_unact], dim=1)
             content = torch.concat([denoising_logits, content], dim=1)
 
-        return content, enc_topk_bbox_unact, enc_topk_bboxes_list, enc_topk_logits_list, geo_outputs
+        return content, enc_topk_bbox_unact, enc_topk_bboxes_list, enc_topk_logits_list
 
     def forward(self, feats, targets=None):
         timings = {}
@@ -367,7 +230,7 @@ class SARStage1DEIMTransformer(DEIMTransformer):
         else:
             denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = None, None, None, None
 
-        init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list, geo_outputs = \
+        init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list = \
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         t0 = self._tic(memory)
@@ -421,7 +284,6 @@ class SARStage1DEIMTransformer(DEIMTransformer):
                 'pred_corners': out_corners[-1],
                 'ref_points': out_refs[-1],
                 'pred_masks': pred_masks,
-                'geo_outputs': geo_outputs,
                 'up': self.up,
                 'reg_scale': self.reg_scale,
             }
@@ -431,8 +293,9 @@ class SARStage1DEIMTransformer(DEIMTransformer):
                 'pred_boxes': out_bboxes[-1],
                 'pred_masks': pred_masks,
             }
-            if self.return_geometry:
-                out['geo_outputs'] = geo_outputs
+
+        if self.return_geometry:
+            out['geo_outputs'] = {}
 
         if timings:
             out['timings'] = timings

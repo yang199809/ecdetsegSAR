@@ -93,10 +93,10 @@ class CocoEvaluator(object):
             if len(prediction) == 0:
                 continue
 
-            boxes = prediction["boxes"]
+            boxes = _to_cpu(prediction["boxes"])
             boxes = convert_to_xywh(boxes).tolist()
-            scores = prediction["scores"].tolist()
-            labels = prediction["labels"].tolist()
+            scores = _to_cpu(prediction["scores"]).tolist()
+            labels = _to_cpu(prediction["labels"]).tolist()
 
             coco_results.extend(
                 [
@@ -117,12 +117,12 @@ class CocoEvaluator(object):
             if len(prediction) == 0:
                 continue
 
-            masks = prediction["masks"]
+            masks = _to_cpu(prediction["masks"])
 
             masks = masks > 0.5
 
-            scores = prediction.get("mask_scores", prediction["scores"]).tolist()
-            labels = prediction.get("mask_labels", prediction["labels"]).tolist()
+            scores = _to_cpu(prediction.get("mask_scores", prediction["scores"])).tolist()
+            labels = _to_cpu(prediction.get("mask_labels", prediction["labels"])).tolist()
 
             rles = [
                 mask_util.encode(np.array(mask[0, :, :, np.newaxis], dtype=np.uint8, order="F"))[0]
@@ -150,11 +150,11 @@ class CocoEvaluator(object):
             if len(prediction) == 0:
                 continue
 
-            boxes = prediction["boxes"]
+            boxes = _to_cpu(prediction["boxes"])
             boxes = convert_to_xywh(boxes).tolist()
-            scores = prediction["scores"].tolist()
-            labels = prediction["labels"].tolist()
-            keypoints = prediction["keypoints"]
+            scores = _to_cpu(prediction["scores"]).tolist()
+            labels = _to_cpu(prediction["labels"]).tolist()
+            keypoints = _to_cpu(prediction["keypoints"])
             keypoints = keypoints.flatten(start_dim=1).tolist()
 
             coco_results.extend(
@@ -169,6 +169,12 @@ class CocoEvaluator(object):
                 ]
             )
         return coco_results
+
+
+def _to_cpu(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    return value
 
 
 def convert_to_xywh(boxes):

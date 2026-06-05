@@ -359,18 +359,8 @@ class BatchImageCollateFunction(BaseCollateFunction):
             sz = random.choice(self.scales)
             images = F.interpolate(images, size=sz)
             if 'masks' in targets[0]:
-                # print(targets[0])
                 for tg in targets:
-                    masks = tg['masks']
-                    size = (sz, sz) if isinstance(sz, int) else tuple(sz)
-                    if masks.shape[0] == 0:
-                        tg['masks'] = masks.new_zeros((0, size[0], size[1]))
-                    else:
-                        mask_dtype = masks.dtype
-                        tg['masks'] = F.interpolate(
-                            masks[:, None].float(),
-                            size=size,
-                            mode='nearest'
-                        )[:, 0].to(dtype=mask_dtype)
+                    tg['masks'] = F.interpolate(tg['masks'], size=sz, mode='nearest')
+                raise NotImplementedError('')
 
         return images, targets

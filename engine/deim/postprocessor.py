@@ -26,7 +26,8 @@ class PostProcessor(nn.Module):
         'num_classes',
         'use_focal_loss',
         'num_top_queries',
-        'remap_mscoco_category'
+        'remap_mscoco_category',
+        'category_id_offset',
     ]
 
     def __init__(
@@ -34,13 +35,15 @@ class PostProcessor(nn.Module):
         num_classes=80,
         use_focal_loss=True,
         num_top_queries=300,
-        remap_mscoco_category=False
+        remap_mscoco_category=False,
+        category_id_offset=0,
     ) -> None:
         super().__init__()
         self.use_focal_loss = use_focal_loss
         self.num_top_queries = num_top_queries
         self.num_classes = int(num_classes)
         self.remap_mscoco_category = remap_mscoco_category
+        self.category_id_offset = int(category_id_offset)
         self.deploy_mode = False
 
     def extra_repr(self) -> str:
@@ -77,6 +80,8 @@ class PostProcessor(nn.Module):
             from ..data.dataset import mscoco_label2category
             labels = torch.tensor([mscoco_label2category[int(x.item())] for x in labels.flatten()])\
                 .to(boxes.device).reshape(labels.shape)
+        elif self.category_id_offset:
+            labels = labels + self.category_id_offset
 
         results = []
         for lab, box, sco in zip(labels, boxes, scores):

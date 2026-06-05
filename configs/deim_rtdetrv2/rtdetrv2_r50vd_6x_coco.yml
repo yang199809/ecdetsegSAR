@@ -1,5 +1,5 @@
 __include__: [
-  '../dataset/ssdd_detection.yml',
+  '../dataset/coco_detection.yml',
   '../runtime.yml',
   '../base/dataloader.yml',
   '../base/rt_optimizer.yml',

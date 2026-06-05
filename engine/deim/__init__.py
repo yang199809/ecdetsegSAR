@@ -21,10 +21,6 @@ from .rtdetrv2_decoder import RTDETRTransformerv2
 from .postprocessor import PostProcessor
 from .deim_criterion import DEIMCriterion
 from .deim_decoder import DEIMTransformer
-from .sar_segmentation_head import SARSegmentationHead
-from .sar_stage1 import (
-    DEIMv2_SAR_INS_STAGE1,
-    SARStage1DEIMTransformer,
-)
+from .sar_stage1 import DEIMv2_SAR_INS_STAGE1, SARStage1DEIMTransformer
 from .sar_stage1_criterion import SARStage1Criterion
 from .sar_stage1_postprocessor import SARInstancePostProcessor

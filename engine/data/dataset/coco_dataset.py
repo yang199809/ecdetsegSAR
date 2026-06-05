@@ -12,8 +12,8 @@ import torchvision
 
 from PIL import Image
 import faster_coco_eval
+import faster_coco_eval.core.mask as coco_mask
 from ._dataset import DetDataset
-from .weak_geometry import masks_to_weak_geometry, polygons_to_mask
 from .._misc import convert_to_tv_tensor
 from ...core import register
 
@@ -29,25 +29,21 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
     __inject__ = ['transforms', ]
     __share__ = ['remap_mscoco_category']
 
-    def __init__(self, img_folder, ann_file, transforms, return_masks=False,
-                 return_weak_geometry=False, use_category2label=False,
-                 remap_mscoco_category=False):
+    def __init__(self, img_folder, ann_file, transforms, return_masks=False, remap_mscoco_category=False,
+                 category_id_offset=0):
         super(CocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
         self.prepare = ConvertCocoPolysToMask(return_masks)
         self.img_folder = img_folder
         self.ann_file = ann_file
         self.return_masks = return_masks
-        self.return_weak_geometry = return_weak_geometry
-        self.use_category2label = use_category2label
         self.remap_mscoco_category = remap_mscoco_category
+        self.category_id_offset = category_id_offset
 
     def __getitem__(self, idx):
         img, target = self.load_item(idx)
         if self._transforms is not None:
             img, target, _ = self._transforms(img, target, self)
-        if self.return_weak_geometry and 'masks' in target:
-            target.update(masks_to_weak_geometry(target['masks']))
         return img, target
 
     def load_item(self, idx):
@@ -57,10 +53,8 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
 
         if self.remap_mscoco_category:
             image, target = self.prepare(image, target, category2label=mscoco_category2label)
-        elif self.use_category2label:
-            image, target = self.prepare(image, target, category2label=self.category2label)
         else:
-            image, target = self.prepare(image, target)
+            image, target = self.prepare(image, target, category_id_offset=self.category_id_offset)
 
         target['idx'] = torch.tensor([idx])
 
@@ -75,8 +69,6 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
     def extra_repr(self) -> str:
         s = f' img_folder: {self.img_folder}\n ann_file: {self.ann_file}\n'
         s += f' return_masks: {self.return_masks}\n'
-        s += f' return_weak_geometry: {self.return_weak_geometry}\n'
-        s += f' use_category2label: {self.use_category2label}\n'
         if hasattr(self, '_transforms') and self._transforms is not None:
             s += f' transforms:\n   {repr(self._transforms)}'
         if hasattr(self, '_preset') and self._preset is not None:
@@ -101,7 +93,20 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
 
 
 def convert_coco_poly_to_mask(segmentations, height, width):
-    return polygons_to_mask(segmentations, height, width).to(dtype=torch.uint8)
+    masks = []
+    for polygons in segmentations:
+        rles = coco_mask.frPyObjects(polygons, height, width)
+        mask = coco_mask.decode(rles)
+        if len(mask.shape) < 3:
+            mask = mask[..., None]
+        mask = torch.as_tensor(mask, dtype=torch.uint8)
+        mask = mask.any(dim=2)
+        masks.append(mask)
+    if masks:
+        masks = torch.stack(masks, dim=0)
+    else:
+        masks = torch.zeros((0, height, width), dtype=torch.uint8)
+    return masks
 
 
 class ConvertCocoPolysToMask(object):
@@ -129,11 +134,23 @@ class ConvertCocoPolysToMask(object):
         if category2label is not None:
             labels = [category2label[obj["category_id"]] for obj in anno]
         else:
-            labels = [obj["category_id"] for obj in anno]
+            category_id_offset = kwargs.get('category_id_offset', 0)
+            labels = [obj["category_id"] - category_id_offset for obj in anno]
 
         labels = torch.tensor(labels, dtype=torch.int64)
+        if labels.numel() > 0 and labels.min() < 0:
+            raise ValueError(
+                f"Found category_id smaller than category_id_offset={kwargs.get('category_id_offset', 0)} "
+                f"in image_id={int(image_id.item())}."
+            )
 
         if self.return_masks:
+            missing = [obj.get("id", i) for i, obj in enumerate(anno) if "segmentation" not in obj]
+            if missing:
+                raise ValueError(
+                    f"COCO annotation image_id={int(image_id.item())} has objects without segmentation: {missing[:5]}. "
+                    "Instance segmentation training requires segmentation fields."
+                )
             segmentations = [obj["segmentation"] for obj in anno]
             masks = convert_coco_poly_to_mask(segmentations, h, w)
 

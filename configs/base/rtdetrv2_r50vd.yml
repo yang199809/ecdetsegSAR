@@ -29,7 +29,7 @@ PResNet:
   num_stages: 4
   freeze_norm: True
   pretrained: True 
-  local_model_dir: /home/shuangy/DEIMv2/ckpts/
+  local_model_dir: ../RT-DETR-main/rtdetrv2_pytorch/INK1k/
 
 
 HybridEncoder:

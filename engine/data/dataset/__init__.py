@@ -14,9 +14,3 @@ from .coco_eval import CocoEvaluator
 from .coco_utils import get_coco_api_from_dataset
 from .voc_detection import VOCDetection
 from .voc_eval import VOCEvaluator
-from .weak_geometry import (
-    polygons_to_mask,
-    masks_to_weak_geometry,
-    principal_axis_from_mask,
-    anisotropy_from_mask,
-)

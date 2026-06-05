@@ -161,7 +161,7 @@ class TransformerDecoder(nn.Module):
                 attn_mask=None,
                 memory_mask=None,
                 dn_meta=None,
-                return_intermediate_queries=False):
+                return_intermediate_queries: bool = False):
         output = target
         output_detach = pred_corners_undetach = 0
         value = self.value_op(memory, None, None, memory_mask, spatial_shapes)
@@ -218,11 +218,17 @@ class TransformerDecoder(nn.Module):
             ref_points_detach = inter_ref_bbox.detach()
             output_detach = output.detach()
 
-        result = (torch.stack(dec_out_bboxes), torch.stack(dec_out_logits),
-                  torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), pre_bboxes, pre_scores)
+        decoder_outputs = (
+            torch.stack(dec_out_bboxes),
+            torch.stack(dec_out_logits),
+            torch.stack(dec_out_pred_corners),
+            torch.stack(dec_out_refs),
+            pre_bboxes,
+            pre_scores,
+        )
         if return_intermediate_queries:
-            result = result + (torch.stack(dec_out_queries), )
-        return result
+            decoder_outputs = decoder_outputs + (torch.stack(dec_out_queries),)
+        return decoder_outputs
 
 
 @register()

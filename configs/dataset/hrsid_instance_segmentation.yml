@@ -1,19 +1,21 @@
-task: detection
+task: instance_segmentation
 
 evaluator:
   type: CocoEvaluator
-  iou_types: ['bbox', ]
+  iou_types: ['bbox', 'segm']
 
-num_classes: 1 # your dataset classes
+num_classes: 1
 remap_mscoco_category: False
+category_id_offset: 1
 
 train_dataloader:
   type: DataLoader
   dataset:
     type: CocoDetection
-    img_folder: /home/shuangy/DEIMv2/data/ssdd/images/train
-    ann_file: /home/shuangy/DEIMv2/data/ssdd/annotations/train.json
-    return_masks: False
+    img_folder: ./data/HRSID/images/train
+    ann_file: ./data/HRSID/annotations/instances_train.json
+    return_masks: True
+    category_id_offset: 1
     transforms:
       type: Compose
       ops: ~
@@ -23,14 +25,14 @@ train_dataloader:
   collate_fn:
     type: BatchImageCollateFunction
 
-
 val_dataloader:
   type: DataLoader
   dataset:
     type: CocoDetection
-    img_folder: /home/shuangy/DEIMv2/data/ssdd/images/test
-    ann_file: /home/shuangy/DEIMv2/data/ssdd/annotations/test.json
-    return_masks: False
+    img_folder: ./data/HRSID/images/val
+    ann_file: ./data/HRSID/annotations/instances_val.json
+    return_masks: True
+    category_id_offset: 1
     transforms:
       type: Compose
       ops: ~

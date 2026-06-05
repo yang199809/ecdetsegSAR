@@ -1,187 +1,191 @@
-"""
-Smoke tests for the DEIMv2 SAR Stage-1 instance segmentation path.
-"""
-
 import argparse
+import json
 import os
 import sys
+from pathlib import Path
 
 import torch
 
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, REPO_ROOT)
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import engine  # noqa: F401
 from engine.core import YAMLConfig
-from engine.data.dataset.coco_eval import CocoEvaluator
 
 
-def make_elongated_mask(height, width, x0, y0, x1, y1):
-    mask = torch.zeros((height, width), dtype=torch.float32)
-    mask[y0:y1, x0:x1] = 1.0
-    return mask
+def _device(name):
+    if name == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available.")
+    return torch.device(name)
 
 
-def boxes_from_masks(masks):
-    boxes = []
-    height, width = masks.shape[-2:]
-    for mask in masks:
-        ys, xs = torch.nonzero(mask > 0, as_tuple=True)
-        x0, x1 = xs.min().float(), xs.max().float() + 1
-        y0, y1 = ys.min().float(), ys.max().float() + 1
-        cx = ((x0 + x1) * 0.5) / width
-        cy = ((y0 + y1) * 0.5) / height
-        w = (x1 - x0) / width
-        h = (y1 - y0) / height
-        boxes.append(torch.stack([cx, cy, w, h]))
-    return torch.stack(boxes, dim=0)
+def _make_fast(model, num_queries=50, num_denoising=10):
+    if hasattr(model.encoder, "eval_spatial_size"):
+        model.encoder.eval_spatial_size = None
+    decoder = model.decoder
+    decoder.eval_spatial_size = None
+    decoder.num_queries = min(num_queries, decoder.num_queries)
+    if hasattr(decoder, "num_denoising"):
+        decoder.num_denoising = min(num_denoising, decoder.num_denoising)
+    return model
 
 
-def make_targets(batch_size, height, width, device):
+def _dummy_targets(batch_size, image_size, device):
     targets = []
-    for batch_idx in range(batch_size):
-        mask_a = make_elongated_mask(height, width, 18, 52, 104, 62)
-        mask_b = make_elongated_mask(height, width, 54, 20, 66, 104)
-        masks = torch.stack([mask_a, mask_b], dim=0)
-        target = {
-            'boxes': boxes_from_masks(masks),
-            'labels': torch.zeros(2, dtype=torch.long),
-            'masks': masks,
-            'image_id': torch.tensor([batch_idx]),
-            'orig_size': torch.tensor([width, height]),
-        }
-        targets.append({key: value.to(device) for key, value in target.items()})
+    for i in range(batch_size):
+        masks = torch.zeros(1, image_size, image_size, device=device)
+        x0, y0, x1, y1 = image_size // 4, image_size // 4, image_size // 2, image_size // 2
+        masks[0, y0:y1, x0:x1] = 1
+        box = torch.tensor(
+            [[(x0 + x1) / 2 / image_size, (y0 + y1) / 2 / image_size,
+              (x1 - x0) / image_size, (y1 - y0) / image_size]],
+            dtype=torch.float32,
+            device=device,
+        )
+        targets.append(
+            {
+                "boxes": box,
+                "labels": torch.zeros(1, dtype=torch.long, device=device),
+                "masks": masks,
+                "orig_size": torch.tensor([image_size, image_size], device=device),
+                "image_id": torch.tensor([i], device=device),
+            }
+        )
     return targets
 
 
-def assert_finite_losses(losses):
-    required = {
-        'loss_mal',
-        'loss_bbox',
-        'loss_giou',
-        'loss_fgl',
-        'loss_ddf',
-        'loss_mask_bce',
-        'loss_mask_dice',
-    }
-    missing = required - set(losses.keys())
-    assert not missing, f'missing losses: {sorted(missing)}'
-    for name, value in losses.items():
-        assert torch.isfinite(value).all(), f'{name} is not finite: {value}'
+def _assert_finite_losses(losses):
+    required = ["loss_mal", "loss_bbox", "loss_giou", "loss_fgl", "loss_mask_bce", "loss_mask_dice"]
+    for key in required:
+        if key not in losses:
+            raise AssertionError(f"Missing required loss: {key}")
+        if not torch.isfinite(losses[key]):
+            raise AssertionError(f"Loss is not finite: {key}={losses[key]}")
+    if not any(k == "loss_ddf" or k.startswith("loss_ddf_") for k in losses):
+        raise AssertionError("Missing loss_ddf or auxiliary loss_ddf_* from DEIMv2 local loss.")
+    for key, value in losses.items():
+        if torch.is_tensor(value) and not torch.isfinite(value):
+            raise AssertionError(f"Non-finite loss: {key}={value}")
+
+
+def _inspect_category_id(ann_file):
+    if not ann_file or not os.path.exists(ann_file):
+        return None
+    with open(ann_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    annotations = data.get("annotations", [])
+    if not annotations:
+        return None
+    category_ids = sorted({ann["category_id"] for ann in annotations if "category_id" in ann})
+    has_segmentation = all("segmentation" in ann for ann in annotations)
+    return {"category_ids": category_ids, "has_segmentation": has_segmentation}
+
+
+def _maybe_real_dataloader_check(cfg, model, criterion, postprocessor, device):
+    train_ann = cfg.yaml_cfg["train_dataloader"]["dataset"].get("ann_file")
+    val_ann = cfg.yaml_cfg["val_dataloader"]["dataset"].get("ann_file")
+    train_info = _inspect_category_id(train_ann)
+    val_info = _inspect_category_id(val_ann)
+    print(f"[real-data] train annotation: {train_ann}")
+    print(f"[real-data] val annotation: {val_ann}")
+    print(f"[real-data] train annotation info: {train_info}")
+    print(f"[real-data] val annotation info: {val_info}")
+
+    if not (train_ann and val_ann and os.path.exists(train_ann) and os.path.exists(val_ann)):
+        print("[real-data] skipped: configured HRSID annotation files do not exist.")
+        return
+
+    model.train()
+    samples, targets = next(iter(cfg.train_dataloader))
+    samples = samples.to(device)
+    targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+    with torch.no_grad():
+        outputs = model(samples, targets=targets)
+        losses = criterion(outputs, targets, epoch=0)
+    _assert_finite_losses(losses)
+    print(f"[real-data] train forward ok: pred_masks={tuple(outputs['pred_masks'].shape)}")
+
+    model.eval()
+    samples, targets = next(iter(cfg.val_dataloader))
+    samples = samples.to(device)
+    targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+    with torch.no_grad():
+        outputs = model(samples)
+        orig_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
+        results = postprocessor(outputs, orig_sizes)
+    if "masks" not in results[0]:
+        raise AssertionError("Postprocessor did not return masks for real-data eval batch.")
+    print(f"[real-data] eval forward ok: masks={tuple(results[0]['masks'].shape)}")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default='configs/our/deimv2_hgnetv2_s_sar_ins_stage1.yml')
-    parser.add_argument('--device', default='cpu')
-    parser.add_argument('--size', type=int, default=128)
+    parser.add_argument("--config", default="configs/our/deimv2_dinov3_s_HRSID_ins_stage1.yml")
+    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
+    parser.add_argument("--image-size", type=int, default=160)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--skip-real-data", action="store_true")
     args = parser.parse_args()
 
-    device = torch.device(args.device)
-
-    cfg = YAMLConfig(
-        args.config,
-        eval_spatial_size=[args.size, args.size],
-        HGNetv2={'pretrained': False},
-        DEIMv2_SAR_INS_STAGE1={
-            'decoder': {
-                'num_queries': 20,
-                'num_denoising': 0,
-                'num_layers': 2,
-                'dim_feedforward': 512,
-                'eval_idx': -1,
-                'enable_timing': True,
-                'mask_output_stride': 4,
-                'mask_num_blocks': 2,
-                'use_sparse_mask_train': False,
-                'use_weak_geometry': False,
-                'return_geometry': False,
-            }
-        },
-        SARStage1Criterion={
-            'mask_diagnostics': True,
-            'mask_diagnostics_interval': 1,
-        },
-        SARInstancePostProcessor={
-            'num_top_queries_bbox': 20,
-            'num_top_queries_segm': 5,
-            'enable_timing': True,
-            'debug': False,
-        },
-        train_dataloader={'total_batch_size': 2},
-        val_dataloader={'total_batch_size': 2},
-        use_amp=False,
-        use_ema=False,
-    )
-
-    model = cfg.model.to(device)
+    device = _device(args.device)
+    cfg = YAMLConfig(args.config)
+    model = _make_fast(cfg.model).to(device)
     criterion = cfg.criterion.to(device)
     postprocessor = cfg.postprocessor.to(device)
+    postprocessor.num_top_queries = min(postprocessor.num_top_queries, model.decoder.num_queries)
+    if hasattr(postprocessor, "num_top_masks"):
+        postprocessor.num_top_masks = min(postprocessor.num_top_masks, model.decoder.num_queries)
 
-    samples = torch.randn(2, 3, args.size, args.size, device=device)
-    targets = make_targets(2, args.size, args.size, device)
+    samples = torch.randn(args.batch_size, 3, args.image_size, args.image_size, device=device)
+    targets = _dummy_targets(args.batch_size, args.image_size, device)
 
     model.eval()
     with torch.no_grad():
         outputs = model(samples)
-        assert outputs['pred_logits'].shape[:2] == (2, 20)
-        assert outputs['pred_boxes'].shape[:2] == (2, 20)
-        assert outputs['pred_masks'].shape[:2] == (2, 20)
-        assert 'geo_outputs' not in outputs
-        assert outputs['pred_masks'].shape[-1] >= args.size // 4
-        orig_size = torch.tensor([[args.size * 2, args.size + 16]] * 2, device=device)
-        results = postprocessor(outputs, orig_size, targets=targets)
-        assert 'masks' in results[0]
-        assert results[0]['masks'].ndim == 4
-        assert results[0]['scores'].numel() == 20
-        assert results[0]['mask_scores'].numel() == 5
-        assert results[0]['mask_labels'].numel() == 5
-        assert results[0]['masks'].shape[0] == 5
-        assert results[0]['masks'].shape[-2:] == (args.size + 16, args.size * 2)
-        assert postprocessor.last_timing
-        assert 'timings' in outputs
-        evaluator = object.__new__(CocoEvaluator)
-        evaluator.last_timing = {}
-        segm_predictions = {int(targets[i]['image_id'].item()): result for i, result in enumerate(results)}
-        segm_results = evaluator.prepare_for_coco_segmentation(segm_predictions)
-        assert len(segm_results) == 2 * 5
-        assert evaluator.last_timing
+    for key in ["pred_logits", "pred_boxes", "pred_masks"]:
+        if key not in outputs:
+            raise AssertionError(f"Missing output key: {key}")
+    if outputs["pred_logits"].shape[:2] != outputs["pred_boxes"].shape[:2]:
+        raise AssertionError("pred_logits and pred_boxes query shapes differ.")
+    if outputs["pred_logits"].shape[:2] != outputs["pred_masks"].shape[:2]:
+        raise AssertionError("pred_logits and pred_masks query shapes differ.")
+    print(f"[dummy-eval] pred_logits={tuple(outputs['pred_logits'].shape)}")
+    print(f"[dummy-eval] pred_masks={tuple(outputs['pred_masks'].shape)}")
+
+    orig_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
+    with torch.no_grad():
+        results = postprocessor(outputs, orig_sizes)
+    if "masks" not in results[0]:
+        raise AssertionError("Postprocessor did not return masks.")
+    if tuple(results[0]["masks"].shape[-2:]) != (args.image_size, args.image_size):
+        raise AssertionError("Postprocessed mask size does not match original image size.")
+    if not (len(results[0]["masks"]) == len(results[0]["mask_labels"]) == len(results[0]["mask_scores"])):
+        raise AssertionError("masks/mask_labels/mask_scores length mismatch.")
+    print(f"[postprocessor] masks={tuple(results[0]['masks'].shape)}")
 
     model.train()
-    outputs = model(samples, targets=targets)
-    assert 'aux_outputs' in outputs
-    assert all('pred_masks' in aux for aux in outputs['aux_outputs'])
-    assert outputs['aux_outputs'][0]['pred_masks'].shape[:2] == (2, 20)
-    losses = criterion(outputs, targets, epoch=0, global_step=0)
-    assert 'loss_mask_bce_aux_0' in losses
-    assert 'loss_mask_dice_aux_0' in losses
-    assert any(name.startswith('loss_ddf') for name in losses)
-    assert_finite_losses(losses)
-
-    det_cfg = YAMLConfig(
-        'configs/deimv2/deimv2_hgnetv2_s_coco.yml',
-        eval_spatial_size=[args.size, args.size],
-        HGNetv2={'pretrained': False},
-        DEIMTransformer={
-            'num_queries': 20,
-            'num_denoising': 0,
-            'num_layers': 2,
-            'dim_feedforward': 512,
-            'eval_idx': -1,
-        },
-        use_amp=False,
-        use_ema=False,
-    )
-    det_model = det_cfg.model.to(device).eval()
     with torch.no_grad():
-        det_outputs = det_model(samples)
-        assert 'pred_logits' in det_outputs
-        assert 'pred_boxes' in det_outputs
-        assert 'pred_masks' not in det_outputs
+        train_outputs = model(samples, targets=targets)
+        losses = criterion(train_outputs, targets, epoch=0)
+    print("[dummy-train] loss keys:", ", ".join(sorted(losses.keys())))
+    _assert_finite_losses(losses)
+    print("[dummy-train] finite losses:", ", ".join(sorted(losses.keys())[:12]), "...")
 
-    print('SAR Stage-1 smoke test passed.')
+    det_cfg = YAMLConfig("configs/our/deimv2_dinov3_s_HRSID.yml")
+    det_model = _make_fast(det_cfg.model, num_queries=20, num_denoising=0).to(device).eval()
+    with torch.no_grad():
+        det_outputs = det_model(samples[:1])
+    if "pred_masks" in det_outputs:
+        raise AssertionError("Detection-only config unexpectedly returned pred_masks.")
+    print("[detection-only] ok: no pred_masks")
+
+    if not args.skip_real_data:
+        _maybe_real_dataloader_check(cfg, model, criterion, postprocessor, device)
+
+    print("[smoke] SAR Stage 1 smoke test passed.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

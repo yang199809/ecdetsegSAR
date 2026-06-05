@@ -8,7 +8,6 @@ in the end of the file, as python3 can suppress prints with contextlib
 import os
 import contextlib
 import copy
-import time
 import numpy as np
 import torch
 
@@ -33,7 +32,6 @@ class CocoEvaluator(object):
 
         self.img_ids = []
         self.eval_imgs = {k: [] for k in iou_types}
-        self.last_timing = {}
 
     def cleanup(self):
         self.coco_eval = {}
@@ -41,11 +39,9 @@ class CocoEvaluator(object):
             self.coco_eval[iou_type] = COCOeval_faster(self.coco_gt, iouType=iou_type, print_function=print, separate_eval=True)
         self.img_ids = []
         self.eval_imgs = {k: [] for k in self.iou_types}
-        self.last_timing = {}
 
 
     def update(self, predictions):
-        self.last_timing = {}
         img_ids = list(np.unique(list(predictions.keys())))
         self.img_ids.extend(img_ids)
 
@@ -118,36 +114,22 @@ class CocoEvaluator(object):
     def prepare_for_coco_segmentation(self, predictions):
         coco_results = []
         for original_id, prediction in predictions.items():
-            if len(prediction) == 0 or "masks" not in prediction:
+            if len(prediction) == 0:
                 continue
 
-            t0 = time.perf_counter()
-            masks = prediction["masks"].detach().cpu() > 0.5
-            self.last_timing["threshold_sigmoid"] = self.last_timing.get("threshold_sigmoid", 0.0) + \
-                (time.perf_counter() - t0) * 1000.0
-            if masks.ndim == 3:
-                masks = masks[:, None]
+            masks = prediction["masks"]
 
-            scores_tensor = prediction.get("mask_scores", prediction["scores"])
-            labels_tensor = prediction.get("mask_labels", prediction["labels"])
-            if masks.shape[0] != scores_tensor.numel() or masks.shape[0] != labels_tensor.numel():
-                raise ValueError(
-                    "COCO segmentation prediction count mismatch: "
-                    f"{masks.shape[0]} masks, {scores_tensor.numel()} scores, "
-                    f"{labels_tensor.numel()} labels for image_id={original_id}."
-                )
-            scores = scores_tensor.detach().cpu().tolist()
-            labels = labels_tensor.detach().cpu().tolist()
+            masks = masks > 0.5
 
-            t0 = time.perf_counter()
+            scores = prediction.get("mask_scores", prediction["scores"]).tolist()
+            labels = prediction.get("mask_labels", prediction["labels"]).tolist()
+
             rles = [
                 mask_util.encode(np.array(mask[0, :, :, np.newaxis], dtype=np.uint8, order="F"))[0]
                 for mask in masks
             ]
             for rle in rles:
                 rle["counts"] = rle["counts"].decode("utf-8")
-            self.last_timing["rle_encoding"] = self.last_timing.get("rle_encoding", 0.0) + \
-                (time.perf_counter() - t0) * 1000.0
 
             coco_results.extend(
                 [

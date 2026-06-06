@@ -20,6 +20,24 @@ from ..optim.lr_scheduler import FlatCosineLRScheduler
 
 
 class DetSolver(BaseSolver):
+    @staticmethod
+    def _select_primary_metric(test_stats):
+        if 'coco_eval_masks' in test_stats:
+            return 'coco_eval_masks'
+        if 'coco_eval_bbox' in test_stats:
+            return 'coco_eval_bbox'
+        return next(iter(test_stats))
+
+    @staticmethod
+    def _update_best_stat(best_stat, test_stats, epoch):
+        improved = []
+        for k, values in test_stats.items():
+            metric = values[0]
+            if k not in best_stat or metric > best_stat[k]:
+                best_stat[k] = metric
+                best_stat[f'{k}_epoch'] = epoch
+                improved.append(k)
+        return improved
 
     def fit(self, ):
         self.train()
@@ -46,7 +64,6 @@ class DetSolver(BaseSolver):
         n_parameters = sum([p.numel() for p in self.model.parameters() if not p.requires_grad])
         print(f'number of non-trainable parameters: {n_parameters}')
 
-        top1 = 0
         best_stat = {'epoch': -1, }
         # evaluate again before resume training
         if self.last_epoch > 0:
@@ -59,13 +76,11 @@ class DetSolver(BaseSolver):
                 self.evaluator,
                 self.device
             )
-            for k in test_stats:
-                best_stat['epoch'] = self.last_epoch
-                best_stat[k] = test_stats[k][0]
-                top1 = test_stats[k][0]
-                print(f'best_stat: {best_stat}')
+            primary_metric = self._select_primary_metric(test_stats)
+            self._update_best_stat(best_stat, test_stats, self.last_epoch)
+            best_stat['epoch'] = best_stat.get(f'{primary_metric}_epoch', self.last_epoch)
+            print(f'best_stat: {best_stat}')
 
-        best_stat_print = best_stat.copy()
         start_time = time.time()
         start_epoch = self.last_epoch + 1
         for epoch in range(start_epoch, args.epoches):
@@ -128,40 +143,23 @@ class DetSolver(BaseSolver):
                     for i, v in enumerate(test_stats[k]):
                         self.writer.add_scalar(f'Test/{k}_{i}'.format(k), v, epoch)
 
-                if k in best_stat:
-                    best_stat['epoch'] = epoch if test_stats[k][0] > best_stat[k] else best_stat['epoch']
-                    best_stat[k] = max(best_stat[k], test_stats[k][0])
+            primary_metric = self._select_primary_metric(test_stats)
+            improved = self._update_best_stat(best_stat, test_stats, epoch)
+            best_stat['epoch'] = best_stat.get(f'{primary_metric}_epoch', epoch)
+            print(f'best_stat: {best_stat}')
+
+            primary_improved = primary_metric in improved
+            if self.output_dir and primary_improved:
+                if epoch >= self.train_dataloader.collate_fn.stop_epoch:
+                    dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg2.pth')
                 else:
-                    best_stat['epoch'] = epoch
-                    best_stat[k] = test_stats[k][0]
+                    dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg1.pth')
 
-                if best_stat[k] > top1:
-                    best_stat_print['epoch'] = epoch
-                    top1 = best_stat[k]
-                    if self.output_dir:
-                        if epoch >= self.train_dataloader.collate_fn.stop_epoch:
-                            dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg2.pth')
-                        else:
-                            dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg1.pth')
-
-                best_stat_print[k] = max(best_stat[k], top1)
-                print(f'best_stat: {best_stat_print}')  # global best
-
-                if best_stat['epoch'] == epoch and self.output_dir:
-                    if epoch >= self.train_dataloader.collate_fn.stop_epoch:
-                        if test_stats[k][0] > top1:
-                            top1 = test_stats[k][0]
-                            dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg2.pth')
-                    else:
-                        top1 = max(test_stats[k][0], top1)
-                        dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg1.pth')
-
-                elif epoch >= self.train_dataloader.collate_fn.stop_epoch:
-                    best_stat = {'epoch': -1, }
-                    self.ema.decay -= 0.0001
-                    self.load_resume_state(str(self.output_dir / 'best_stg1.pth'))
-                    print(f'Refresh EMA at epoch {epoch} with decay {self.ema.decay}')
-
+            elif epoch >= self.train_dataloader.collate_fn.stop_epoch and self.output_dir and self.ema is not None:
+                best_stat = {'epoch': -1, }
+                self.ema.decay -= 0.0001
+                self.load_resume_state(str(self.output_dir / 'best_stg1.pth'))
+                print(f'Refresh EMA at epoch {epoch} with decay {self.ema.decay}')
 
             log_stats = {
                 **{f'train_{k}': v for k, v in train_stats.items()},

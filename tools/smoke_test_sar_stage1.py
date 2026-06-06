@@ -70,6 +70,52 @@ def _assert_finite_losses(losses):
             raise AssertionError(f"Non-finite loss: {key}={value}")
 
 
+def _assert_forward_layers(model, device):
+    decoder = model.decoder
+    hidden_dim = decoder.hidden_dim
+    num_layers = len(decoder.decoder.layers)
+    batch_size, num_queries = 2, 7
+    spatial = torch.randn(batch_size, hidden_dim, 10, 10, device=device)
+    query_layers = torch.randn(num_layers, batch_size, num_queries, hidden_dim, device=device)
+
+    with torch.no_grad():
+        pred_masks_all = decoder.mask_head.forward_layers(spatial, query_layers)
+
+    expected_hw = 20 if decoder.mask_head.mask_output_stride == 4 else 10
+    expected = (num_layers, batch_size, num_queries, expected_hw, expected_hw)
+    if tuple(pred_masks_all.shape) != expected:
+        raise AssertionError(f"forward_layers shape mismatch: got {tuple(pred_masks_all.shape)}, expected {expected}")
+    print(f"[mask-head] forward_layers pred_masks_all={tuple(pred_masks_all.shape)}")
+
+
+def _assert_matcher_warmup(criterion):
+    matcher = criterion.matcher
+    if not hasattr(matcher, "_mask_cost_weight_scale"):
+        raise AssertionError("Matcher is missing _mask_cost_weight_scale().")
+
+    start = matcher.mask_cost_start_epoch
+    warmup = matcher.mask_cost_warmup_epochs
+    if warmup <= 0:
+        if matcher._mask_cost_weight_scale(0) != 1.0:
+            raise AssertionError("Matcher warmup disabled but scale is not 1.0.")
+        print("[matcher] mask cost warmup disabled: scale=1.0")
+        return
+
+    if matcher._mask_cost_weight_scale(max(0, start - 1)) != 0.0:
+        raise AssertionError("Matcher mask cost scale should be 0 before start epoch.")
+    mid_scale = matcher._mask_cost_weight_scale(start)
+    if not (0.0 < mid_scale <= 1.0):
+        raise AssertionError(f"Matcher warmup scale should be in (0, 1], got {mid_scale}.")
+    final_scale = matcher._mask_cost_weight_scale(start + warmup)
+    if final_scale != 1.0:
+        raise AssertionError(f"Matcher warmup scale should be 1 after warmup, got {final_scale}.")
+    print(
+        "[matcher] mask cost warmup scales: "
+        f"pre={matcher._mask_cost_weight_scale(max(0, start - 1)):.3f}, "
+        f"start={mid_scale:.3f}, post={final_scale:.3f}"
+    )
+
+
 def _inspect_category_id(ann_file):
     if not ann_file or not os.path.exists(ann_file):
         return None
@@ -141,6 +187,9 @@ def main():
     samples = torch.randn(args.batch_size, 3, args.image_size, args.image_size, device=device)
     targets = _dummy_targets(args.batch_size, args.image_size, device)
 
+    _assert_forward_layers(model, device)
+    _assert_matcher_warmup(criterion)
+
     model.eval()
     with torch.no_grad():
         outputs = model(samples)
@@ -169,6 +218,16 @@ def main():
     with torch.no_grad():
         train_outputs = model(samples, targets=targets)
         losses = criterion(train_outputs, targets, epoch=0)
+    if "aux_outputs" in train_outputs:
+        aux_with_masks = [aux for aux in train_outputs["aux_outputs"] if "pred_masks" in aux]
+        if len(aux_with_masks) != len(train_outputs["aux_outputs"]):
+            raise AssertionError("Auxiliary detection outputs are not fully aligned with mask outputs.")
+        expected_layers = len(train_outputs["aux_outputs"]) + 1
+        if expected_layers != len(model.decoder.decoder.layers):
+            raise AssertionError(
+                f"Unexpected decoder layer count: aux+final={expected_layers}, "
+                f"decoder_layers={len(model.decoder.decoder.layers)}"
+            )
     print("[dummy-train] loss keys:", ", ".join(sorted(losses.keys())))
     _assert_finite_losses(losses)
     print("[dummy-train] finite losses:", ", ".join(sorted(losses.keys())[:12]), "...")

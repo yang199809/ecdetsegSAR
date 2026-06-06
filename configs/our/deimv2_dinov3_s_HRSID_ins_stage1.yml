@@ -55,7 +55,7 @@ SARStage1DEIMTransformer:
   mask_hidden_dim: 128
   mask_output_stride: 4
   mask_num_blocks: 4
-  use_multiscale_mask_fusion: True
+  use_multiscale_mask_fusion: False
   use_mask_aux_loss: True
   use_sparse_mask_train: False
 
@@ -138,9 +138,14 @@ SARStage1Criterion:
       cost_class: 2
       cost_bbox: 1
       cost_giou: 1
-      cost_mask_bce: 5.0
-      cost_mask_dice: 5.0
+      cost_mask_bce: 1.0
+      cost_mask_dice: 1.0
     alpha: 0.25
     gamma: 2.0
     mask_point_sample_ratio: 16
+    mask_min_sampled_points: 128
+    mask_max_sampled_points: 512
+    mask_cost_start_epoch: 5
+    mask_cost_warmup_epochs: 10
+    mask_cost_warmup_mode: linear
     change_matcher: False

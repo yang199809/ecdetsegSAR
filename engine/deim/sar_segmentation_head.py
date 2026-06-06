@@ -89,20 +89,14 @@ class SARSegmentationHead(nn.Module):
         self.bias = nn.Parameter(torch.zeros(1))
         self.scale = mask_hidden_dim ** -0.5
 
-    def forward(
+    def build_pixel_embedding(
         self,
         spatial_feature: torch.Tensor,
-        query_features: torch.Tensor,
         multiscale_features: list[torch.Tensor] | None = None,
-        block_index: int | None = None,
     ) -> torch.Tensor:
         if spatial_feature.shape[1] != self.hidden_dim:
             raise ValueError(
                 f"Expected spatial feature channels={self.hidden_dim}, got {spatial_feature.shape[1]}"
-            )
-        if query_features.shape[-1] != self.hidden_dim:
-            raise ValueError(
-                f"Expected query dim={self.hidden_dim}, got {query_features.shape[-1]}"
             )
 
         # The highest-resolution encoded feature is stride 8 in DEIMv2; Stage 1 predicts stride 4 masks.
@@ -118,12 +112,65 @@ class SARSegmentationHead(nn.Module):
                     proj(feat), size=pixel_embed.shape[-2:], mode="bilinear", align_corners=False
                 )
 
+        return pixel_embed
+
+    def build_query_embedding(self, query_features: torch.Tensor) -> torch.Tensor:
+        if query_features.shape[-1] != self.hidden_dim:
+            raise ValueError(
+                f"Expected query dim={self.hidden_dim}, got {query_features.shape[-1]}"
+            )
+        return self.query_proj(self.query_block(query_features))
+
+    def _apply_pixel_block(self, pixel_embed: torch.Tensor, block_index: int | None) -> torch.Tensor:
+        if len(self.pixel_blocks) == 0:
+            return pixel_embed
         if block_index is None:
             blocks = self.pixel_blocks
         else:
             blocks = [self.pixel_blocks[min(block_index, len(self.pixel_blocks) - 1)]]
         for block in blocks:
             pixel_embed = block(pixel_embed)
+        return pixel_embed
 
-        query_embed = self.query_proj(self.query_block(query_features))
+    def forward_layers(
+        self,
+        spatial_feature: torch.Tensor,
+        query_layers: torch.Tensor | list[torch.Tensor],
+        multiscale_features: list[torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """EdgeCrafter-style progressive mask prediction.
+
+        Dense spatial features are projected and fused once, then refined
+        progressively while each decoder layer emits its own query masks.
+        """
+        if isinstance(query_layers, torch.Tensor):
+            if query_layers.dim() != 4:
+                raise ValueError(f"Expected query_layers [L, B, Q, C], got {tuple(query_layers.shape)}")
+            query_iter = query_layers.unbind(0)
+        else:
+            query_iter = list(query_layers)
+            if not query_iter:
+                raise ValueError("query_layers must contain at least one decoder layer.")
+
+        pixel_embed = self.build_pixel_embedding(spatial_feature, multiscale_features)
+
+        masks = []
+        for layer_idx, query_features in enumerate(query_iter):
+            pixel_embed = self._apply_pixel_block(pixel_embed, layer_idx)
+            query_embed = self.build_query_embedding(query_features)
+            masks.append(torch.einsum("bchw,bqc->bqhw", pixel_embed, query_embed) * self.scale + self.bias)
+
+        return torch.stack(masks, dim=0)
+
+    def forward(
+        self,
+        spatial_feature: torch.Tensor,
+        query_features: torch.Tensor,
+        multiscale_features: list[torch.Tensor] | None = None,
+        block_index: int | None = None,
+    ) -> torch.Tensor:
+        pixel_embed = self.build_pixel_embedding(spatial_feature, multiscale_features)
+        pixel_embed = self._apply_pixel_block(pixel_embed, block_index)
+
+        query_embed = self.build_query_embedding(query_features)
         return torch.einsum("bchw,bqc->bqhw", pixel_embed, query_embed) * self.scale + self.bias

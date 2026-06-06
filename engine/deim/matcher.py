@@ -31,7 +31,9 @@ class HungarianMatcher(nn.Module):
 
     def __init__(self, weight_dict, use_focal_loss=False, alpha=0.25, gamma=2.0,
                 change_matcher=False, iou_order_alpha=1.0, matcher_change_epoch=10000,
-                mask_point_sample_ratio=16):
+                mask_point_sample_ratio=16, mask_min_sampled_points=128, mask_max_sampled_points=512,
+                mask_cost_warmup_epochs=0, mask_cost_start_epoch=0,
+                mask_cost_warmup_mode="linear"):
         """Creates the matcher
 
         Params:
@@ -46,6 +48,11 @@ class HungarianMatcher(nn.Module):
         self.cost_mask_bce = weight_dict.get('cost_mask_bce', 0.0)
         self.cost_mask_dice = weight_dict.get('cost_mask_dice', 0.0)
         self.mask_point_sample_ratio = mask_point_sample_ratio
+        self.mask_min_sampled_points = mask_min_sampled_points
+        self.mask_max_sampled_points = mask_max_sampled_points
+        self.mask_cost_warmup_epochs = mask_cost_warmup_epochs
+        self.mask_cost_start_epoch = mask_cost_start_epoch
+        self.mask_cost_warmup_mode = mask_cost_warmup_mode
 
         self.change_matcher = change_matcher
         self.iou_order_alpha = iou_order_alpha
@@ -59,6 +66,20 @@ class HungarianMatcher(nn.Module):
 
         assert self.cost_class != 0 or self.cost_bbox != 0 or self.cost_giou != 0 \
             or self.cost_mask_bce != 0 or self.cost_mask_dice != 0, "all costs cant be 0"
+
+    def _mask_cost_weight_scale(self, epoch: int):
+        if self.mask_cost_warmup_epochs <= 0:
+            return 1.0
+
+        if epoch < self.mask_cost_start_epoch:
+            return 0.0
+
+        progress = (epoch - self.mask_cost_start_epoch + 1) / float(self.mask_cost_warmup_epochs)
+        if self.mask_cost_warmup_mode == "step":
+            return 1.0 if progress >= 1.0 else 0.0
+        if self.mask_cost_warmup_mode != "linear":
+            raise ValueError(f"Unsupported mask_cost_warmup_mode: {self.mask_cost_warmup_mode}")
+        return float(max(0.0, min(1.0, progress)))
 
     def _mask_cost(self, outputs, targets):
         if (self.cost_mask_bce == 0 and self.cost_mask_dice == 0) or "pred_masks" not in outputs:
@@ -86,6 +107,8 @@ class HungarianMatcher(nn.Module):
 
         height, width = outputs["pred_masks"].shape[-2:]
         num_points = max(1, (height * width) // max(1, self.mask_point_sample_ratio))
+        num_points = max(num_points, self.mask_min_sampled_points)
+        num_points = min(num_points, self.mask_max_sampled_points)
         point_coords = torch.rand(1, num_points, 2, device=pred_masks.device)
 
         pred_points = F.grid_sample(
@@ -191,9 +214,11 @@ class HungarianMatcher(nn.Module):
             # Final cost matrix 3 * self.cost_bbox + 2 * self.cost_class + self.cost_giou
             C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
 
+        mask_scale = self._mask_cost_weight_scale(epoch)
+        if mask_scale > 0:
             mask_cost = self._mask_cost(outputs, targets)
             if mask_cost is not None:
-                C = C + mask_cost
+                C = C + mask_scale * mask_cost
 
         C = C.view(bs, num_queries, -1).cpu()
 

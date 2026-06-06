@@ -55,11 +55,12 @@ class SARStage1DEIMTransformer(DEIMTransformer):
         ]
 
     def _predict_masks(self, mask_features, query_layers: torch.Tensor):
-        masks = [
-            self.mask_head(mask_features[0], layer_queries, multiscale_features=mask_features, block_index=i)
-            for i, layer_queries in enumerate(query_layers)
-        ]
-        return torch.stack(masks, dim=0)
+        multiscale_features = mask_features if self.mask_head.use_multiscale_fusion else None
+        return self.mask_head.forward_layers(
+            spatial_feature=mask_features[0],
+            query_layers=query_layers,
+            multiscale_features=multiscale_features,
+        )
 
     def forward(self, feats, targets=None):
         memory, spatial_shapes = self._get_encoder_input(feats)
@@ -110,6 +111,16 @@ class SARStage1DEIMTransformer(DEIMTransformer):
             _, out_queries = torch.split(out_queries, dn_meta["dn_num_split"], dim=2)
 
         pred_masks_all = self._predict_masks(mask_features, out_queries)
+        if pred_masks_all.shape[0] != out_logits.shape[0]:
+            raise RuntimeError(
+                "Stage 1 mask layer count mismatch: "
+                f"pred_masks_all={tuple(pred_masks_all.shape)}, out_logits={tuple(out_logits.shape)}"
+            )
+        if pred_masks_all.shape[1:3] != out_logits.shape[1:3]:
+            raise RuntimeError(
+                "Stage 1 mask batch/query mismatch: "
+                f"pred_masks_all={tuple(pred_masks_all.shape)}, out_logits={tuple(out_logits.shape)}"
+            )
 
         if self.training:
             out = {

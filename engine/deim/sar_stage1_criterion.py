@@ -36,16 +36,12 @@ class SARStage1Criterion(DEIMCriterion):
         mask_point_sample_ratio: int = 16,
         oversample_ratio: float = 3.0,
         importance_sample_ratio: float = 0.75,
-        mask_min_sampled_points: int = 256,
-        mask_max_sampled_points: int = 1024,
         **kwargs,
     ):
         super().__init__(matcher=matcher, weight_dict=weight_dict, losses=losses, **kwargs)
         self.mask_point_sample_ratio = mask_point_sample_ratio
         self.oversample_ratio = oversample_ratio
         self.importance_sample_ratio = importance_sample_ratio
-        self.mask_min_sampled_points = mask_min_sampled_points
-        self.mask_max_sampled_points = mask_max_sampled_points
 
     def _validate_masks(self, targets):
         for batch_idx, target in enumerate(targets):
@@ -65,10 +61,7 @@ class SARStage1Criterion(DEIMCriterion):
 
     def _num_sampled_points(self, pred_masks):
         _, _, height, width = pred_masks.shape
-        points = max(1, (height * width) // max(1, self.mask_point_sample_ratio))
-        points = max(points, self.mask_min_sampled_points)
-        points = min(points, self.mask_max_sampled_points)
-        return points
+        return max(height, (height * width) // max(1, self.mask_point_sample_ratio))
 
     def _sample_points(self, src_masks, num_points):
         num_masks = src_masks.shape[0]

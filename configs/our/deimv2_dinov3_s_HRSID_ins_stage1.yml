@@ -130,8 +130,6 @@ SARStage1Criterion:
   mask_point_sample_ratio: 16
   oversample_ratio: 3.0
   importance_sample_ratio: 0.75
-  mask_min_sampled_points: 256
-  mask_max_sampled_points: 1024
   matcher:
     type: HungarianMatcher
     weight_dict:
@@ -143,8 +141,6 @@ SARStage1Criterion:
     alpha: 0.25
     gamma: 2.0
     mask_point_sample_ratio: 16
-    mask_min_sampled_points: 128
-    mask_max_sampled_points: 512
     mask_cost_start_epoch: 5
     mask_cost_warmup_epochs: 10
     mask_cost_warmup_mode: linear

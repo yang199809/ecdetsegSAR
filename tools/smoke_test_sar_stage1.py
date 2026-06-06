@@ -116,6 +116,17 @@ def _assert_matcher_warmup(criterion):
     )
 
 
+def _assert_criterion_point_sampling(criterion, outputs):
+    height, width = outputs["pred_masks"].shape[-2:]
+    expected_points = max(height, (height * width) // max(1, criterion.mask_point_sample_ratio))
+    actual_points = criterion._num_sampled_points(outputs["pred_masks"])
+    if actual_points != expected_points:
+        raise AssertionError(
+            f"Criterion mask point sampling mismatch: got {actual_points}, expected {expected_points}."
+        )
+    print(f"[criterion] mask point sampling points={actual_points}")
+
+
 def _inspect_category_id(ann_file):
     if not ann_file or not os.path.exists(ann_file):
         return None
@@ -200,6 +211,7 @@ def main():
         raise AssertionError("pred_logits and pred_boxes query shapes differ.")
     if outputs["pred_logits"].shape[:2] != outputs["pred_masks"].shape[:2]:
         raise AssertionError("pred_logits and pred_masks query shapes differ.")
+    _assert_criterion_point_sampling(criterion, outputs)
     print(f"[dummy-eval] pred_logits={tuple(outputs['pred_logits'].shape)}")
     print(f"[dummy-eval] pred_masks={tuple(outputs['pred_masks'].shape)}")
 

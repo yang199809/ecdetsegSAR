@@ -31,9 +31,8 @@ class HungarianMatcher(nn.Module):
 
     def __init__(self, weight_dict, use_focal_loss=False, alpha=0.25, gamma=2.0,
                 change_matcher=False, iou_order_alpha=1.0, matcher_change_epoch=10000,
-                mask_point_sample_ratio=16, mask_min_sampled_points=128, mask_max_sampled_points=512,
-                mask_cost_warmup_epochs=0, mask_cost_start_epoch=0,
-                mask_cost_warmup_mode="linear"):
+                mask_point_sample_ratio=16, mask_cost_warmup_epochs=0,
+                mask_cost_start_epoch=0, mask_cost_warmup_mode="linear"):
         """Creates the matcher
 
         Params:
@@ -48,8 +47,6 @@ class HungarianMatcher(nn.Module):
         self.cost_mask_bce = weight_dict.get('cost_mask_bce', 0.0)
         self.cost_mask_dice = weight_dict.get('cost_mask_dice', 0.0)
         self.mask_point_sample_ratio = mask_point_sample_ratio
-        self.mask_min_sampled_points = mask_min_sampled_points
-        self.mask_max_sampled_points = mask_max_sampled_points
         self.mask_cost_warmup_epochs = mask_cost_warmup_epochs
         self.mask_cost_start_epoch = mask_cost_start_epoch
         self.mask_cost_warmup_mode = mask_cost_warmup_mode
@@ -107,8 +104,6 @@ class HungarianMatcher(nn.Module):
 
         height, width = outputs["pred_masks"].shape[-2:]
         num_points = max(1, (height * width) // max(1, self.mask_point_sample_ratio))
-        num_points = max(num_points, self.mask_min_sampled_points)
-        num_points = min(num_points, self.mask_max_sampled_points)
         point_coords = torch.rand(1, num_points, 2, device=pred_masks.device)
 
         pred_points = F.grid_sample(

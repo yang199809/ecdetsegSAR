@@ -53,6 +53,8 @@ def main(args, ) -> None:
     if args.resume or args.tuning:
         if 'ViTAdapter' in cfg.yaml_cfg:
             cfg.yaml_cfg['ViTAdapter']['skip_load_backbone'] = True
+        if 'DINOv3Adapter' in cfg.yaml_cfg:
+            cfg.yaml_cfg['DINOv3Adapter']['skip_load_backbone'] = True
 
     print('cfg: ', cfg.__dict__)
 

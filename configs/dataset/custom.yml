@@ -1,0 +1,42 @@
+task: detection
+
+evaluator:
+  type: CocoEvaluator
+  iou_types: ['bbox', ]
+  verbose: False
+
+num_classes: 1 # your dataset classes
+remap_mscoco_category: False
+
+train_dataloader:
+  type: DataLoader
+  dataset:
+    type: CocoDetection
+    img_folder: /home/yangshuang/EdgeCrafter-main/ecdetseg/data/hrsid/images
+    ann_file: /home/yangshuang/EdgeCrafter-main/ecdetseg/data/hrsid/annotations/train2017_fixed.json
+    return_masks: False
+    transforms:
+      type: Compose
+      ops: ~
+  shuffle: True
+  num_workers: 4
+  drop_last: True
+  collate_fn:
+    type: BatchImageCollateFunction
+
+
+val_dataloader:
+  type: DataLoader
+  dataset:
+    type: CocoDetection
+    img_folder: /home/yangshuang/EdgeCrafter-main/ecdetseg/data/hrsid/images
+    ann_file: /home/yangshuang/EdgeCrafter-main/ecdetseg/data/hrsid/annotations/test2017_fixed.json
+    return_masks: False
+    transforms:
+      type: Compose
+      ops: ~
+  shuffle: False
+  num_workers: 4
+  drop_last: False
+  collate_fn:
+    type: BatchImageCollateFunction

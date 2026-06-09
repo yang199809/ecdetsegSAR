@@ -1,0 +1,34 @@
+__include__: [
+  '../dataset/custom.yml',
+  '../ecdet/ecdet_m.yml',
+  'ecseg.yml',
+]
+
+output_dir: outputs/ecseg_m_test_0.0004
+
+ViTAdapter:
+  name: ecseg_vittplus
+  weights_path: ecvits/ecseg_vittplus.pth
+
+
+optimizer:
+  type: AdamW
+
+  params:
+    -
+      # except norm/bn/bias in backbone
+      params: '^(?=.*.backbone)(?!.*(?:norm|bn|bias)).*$'
+      lr: 0.00002
+    -
+      # including all norm/bn/bias in backbone
+      params: '^(?=.*.backbone)(?=.*(?:norm|bn|bias)).*$'
+      lr: 0.00002
+      weight_decay: 0.
+    -
+      # including all norm/bn/bias except for the backbone
+      params: '^(?!.*\.backbone)(?=.*(?:norm|bn|bias)).*$'
+      weight_decay: 0.
+
+  lr: 0.0004
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001

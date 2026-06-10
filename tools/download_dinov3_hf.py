@@ -6,8 +6,8 @@ from huggingface_hub import snapshot_download
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--repo-id", default="facebook/dinov3-vits16-pretrain-lvd1689m")
-    parser.add_argument("--local-dir", default=os.path.join("weights", "dinov3-vits16-pretrain-lvd1689m"))
+    parser.add_argument("--repo-id", default="timm/vit_small_patch16_dinov3.lvd1689m")
+    parser.add_argument("--local-dir", default=os.path.join("weights", "vit_small_patch16_dinov3.lvd1689m"))
     parser.add_argument("--cache-dir", default=os.path.join("weights", "hf_cache"))
     parser.add_argument("--revision", default=None)
     args = parser.parse_args()

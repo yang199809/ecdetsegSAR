@@ -2,8 +2,8 @@
 DINOv3 adapter for ECDet.
 
 This module keeps the ECDet neck/decoder contract unchanged by converting
-Hugging Face DINOv3/ViT-S patch tokens into three 256-channel feature maps
-at strides 8, 16, and 32.
+timm DINOv3/ViT-S feature maps into three 256-channel feature maps at
+strides 8, 16, and 32.
 """
 
 from pathlib import Path
@@ -66,16 +66,14 @@ class DINOv3Adapter(nn.Module):
     def __init__(
         self,
         name="dinov3_vits16",
-        source="huggingface",
-        hf_model_id="facebook/dinov3-vits16-pretrain-lvd1689m",
-        hf_cache_dir=None,
-        local_files_only=False,
-        trust_remote_code=False,
+        source="timm",
+        timm_model_name="vit_small_patch16_dinov3.lvd1689m",
+        hf_model_id="timm/vit_small_patch16_dinov3.lvd1689m",
+        cache_dir=None,
         weights_path=None,
         pretrained=True,
         embed_dim=384,
         num_heads=6,
-        num_register_tokens=4,
         proj_dim=256,
         out_indices=[5, 8, 11],
         patch_size=16,
@@ -94,13 +92,11 @@ class DINOv3Adapter(nn.Module):
 
         self.name = name
         self.source = source
+        self.timm_model_name = timm_model_name
         self.hf_model_id = hf_model_id
-        self.hf_cache_dir = hf_cache_dir
-        self.local_files_only = local_files_only
-        self.trust_remote_code = trust_remote_code
+        self.cache_dir = cache_dir
         self.embed_dim = embed_dim
         self.num_heads = num_heads
-        self.num_register_tokens = num_register_tokens
         self.proj_dim = proj_dim
         self.out_indices = list(out_indices)
         self.patch_size = patch_size
@@ -109,7 +105,7 @@ class DINOv3Adapter(nn.Module):
         self.use_checkpoint = use_checkpoint
         self._weights_loaded_by_builder = False
 
-        self.backbone = self._build_hf_backbone(
+        self.backbone = self._build_timm_backbone(
             pretrained=pretrained and not skip_load_backbone,
             drop_path_rate=drop_path_rate,
             weights_path=weights_path,
@@ -127,115 +123,68 @@ class DINOv3Adapter(nn.Module):
         if pretrained and not skip_load_backbone and not self._weights_loaded_by_builder:
             self._load_weights(weights_path)
 
-    def _build_hf_backbone(self, pretrained=True, drop_path_rate=0.0, weights_path=None, **kwargs):
-        if self.source not in ("huggingface", "hf"):
+    def _build_timm_backbone(self, pretrained=True, drop_path_rate=0.0, weights_path=None, **kwargs):
+        if self.source != "timm":
             raise ValueError(
-                "DINOv3Adapter now builds the backbone only from Hugging Face/Transformers. "
-                "Please set source: huggingface."
+                "DINOv3Adapter now builds the backbone only from timm. "
+                "Please set source: timm."
             )
 
         try:
-            from transformers import AutoModel
+            import timm
         except Exception as exc:
             raise RuntimeError(
-                "DINOv3Adapter(source='huggingface') requires transformers with DINOv3 support "
-                "(transformers>=4.56.0 is recommended)."
+                "DINOv3Adapter(source='timm') requires timm with DINOv3 support "
+                "(timm>=1.0.20 is recommended)."
             ) from exc
 
         path = Path(weights_path) if weights_path else None
-
-        if path is not None and path.is_dir():
-            try:
-                model = AutoModel.from_pretrained(
-                    str(path),
-                    cache_dir=self.hf_cache_dir,
-                    local_files_only=self.local_files_only,
-                    trust_remote_code=self.trust_remote_code,
-                    output_hidden_states=True,
-                    **kwargs,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "Failed to load local Hugging Face DINOv3 snapshot. "
-                    "The directory should contain config.json and model weights downloaded "
-                    f"from {self.hf_model_id}. weights_path={weights_path}, "
-                    f"local_files_only={self.local_files_only}."
-                ) from exc
-            self._weights_loaded_by_builder = True
-            print(f"[DINOv3Adapter] Loaded Hugging Face DINOv3 backbone from local directory: {path}")
-            return model
-
-        if path is not None and path.is_file():
-            print(f"[DINOv3Adapter] Building Hugging Face DINOv3 backbone and loading local weight file: {path}")
-            return self._build_hf_model_from_config(drop_path_rate=drop_path_rate, **kwargs)
-
-        if pretrained and weights_path:
+        if pretrained and not weights_path:
+            raise RuntimeError(
+                "DINOv3Adapter pretrained=True requires a local weights_path when source='timm'. "
+                "Please download timm/vit_small_patch16_dinov3.lvd1689m first."
+            )
+        if pretrained and weights_path and path is not None and not path.exists():
             raise RuntimeError(
                 f"DINOv3Adapter pretrained=True but weights_path does not exist: {weights_path}. "
-                "Download the Hugging Face snapshot first, or point weights_path to a local .pth/.bin/.safetensors file."
+                "Download the timm DINOv3 weights first, or point weights_path to a local .pth/.bin/.safetensors file."
             )
 
-        if pretrained:
-            try:
-                model = AutoModel.from_pretrained(
-                    self.hf_model_id,
-                    cache_dir=self.hf_cache_dir,
-                    local_files_only=self.local_files_only,
-                    trust_remote_code=self.trust_remote_code,
-                    output_hidden_states=True,
-                    **kwargs,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "Failed to download/load DINOv3 from Hugging Face. Check network/access permissions, "
-                    f"hf_model_id={self.hf_model_id}, local_files_only={self.local_files_only}."
-                ) from exc
-            self._weights_loaded_by_builder = True
-            print(f"[DINOv3Adapter] Downloaded/loaded Hugging Face DINOv3 backbone: {self.hf_model_id}")
-            return model
-
-        return self._build_hf_model_from_config(drop_path_rate=drop_path_rate, **kwargs)
-
-    def _build_hf_model_from_config(self, drop_path_rate=0.0, **kwargs):
+        create_kwargs = dict(
+            pretrained=False,
+            num_classes=0,
+            img_size=kwargs.pop("img_size", kwargs.pop("image_size", 640)),
+            drop_path_rate=drop_path_rate,
+            **kwargs,
+        )
         try:
-            from transformers import DINOv3ViTConfig, DINOv3ViTModel
+            model = timm.create_model(self.timm_model_name, **create_kwargs)
         except Exception as exc:
             raise RuntimeError(
-                "Random DINOv3 construction requires transformers>=4.56.0 with "
-                "DINOv3ViTConfig/DINOv3ViTModel."
+                f"Failed to build timm DINOv3 model '{self.timm_model_name}'. "
+                "Please install a recent timm version with DINOv3 support."
             ) from exc
 
-        config = DINOv3ViTConfig(
-            image_size=kwargs.pop("image_size", 640),
-            patch_size=self.patch_size,
-            hidden_size=self.embed_dim,
-            num_hidden_layers=max(self.out_indices) + 1,
-            num_attention_heads=self.num_heads,
-            num_register_tokens=self.num_register_tokens,
-            drop_path_rate=drop_path_rate,
-            output_hidden_states=True,
-        )
-        return DINOv3ViTModel(config)
+        return model
 
     def _sync_backbone_dims(self):
-        config = getattr(self.backbone, "config", None)
-        hidden_size = getattr(config, "hidden_size", None)
+        hidden_size = getattr(self.backbone, "num_features", None) or getattr(self.backbone, "embed_dim", None)
         if hidden_size is not None and hidden_size != self.embed_dim:
-            print(f"[DINOv3Adapter] Using backbone hidden_size={hidden_size} instead of embed_dim={self.embed_dim}.")
+            print(f"[DINOv3Adapter] Using timm backbone embed_dim={hidden_size} instead of embed_dim={self.embed_dim}.")
             self.embed_dim = hidden_size
 
-        patch_size = getattr(config, "patch_size", None)
+        patch_size = getattr(getattr(self.backbone, "patch_embed", None), "patch_size", None)
         if isinstance(patch_size, (tuple, list)):
             patch_size = patch_size[0]
         if patch_size is not None and patch_size != self.patch_size:
-            print(f"[DINOv3Adapter] Using backbone patch_size={patch_size} instead of patch_size={self.patch_size}.")
+            print(f"[DINOv3Adapter] Using timm backbone patch_size={patch_size} instead of patch_size={self.patch_size}.")
             self.patch_size = patch_size
 
     def _apply_checkpoint_flag(self):
         if not self.use_checkpoint:
             return
-        if hasattr(self.backbone, "gradient_checkpointing_enable"):
-            self.backbone.gradient_checkpointing_enable()
+        if hasattr(self.backbone, "set_grad_checkpointing"):
+            self.backbone.set_grad_checkpointing(True)
             return
         for module in self.backbone.modules():
             if hasattr(module, "use_checkpoint"):
@@ -244,10 +193,6 @@ class DINOv3Adapter(nn.Module):
     def _freeze_stages(self):
         if self.frozen_stages < 0:
             return
-        if hasattr(self.backbone, "embeddings"):
-            self.backbone.embeddings.eval()
-            for p in self.backbone.embeddings.parameters():
-                p.requires_grad = False
         if hasattr(self.backbone, "patch_embed"):
             self.backbone.patch_embed.eval()
             for p in self.backbone.patch_embed.parameters():
@@ -258,19 +203,6 @@ class DINOv3Adapter(nn.Module):
                 block.eval()
                 for p in block.parameters():
                     p.requires_grad = False
-        encoder = getattr(self.backbone, "encoder", None)
-        hf_encoder = getattr(self.backbone, "model", None)
-        layers = (
-            getattr(encoder, "layer", None)
-            or getattr(encoder, "layers", None)
-            or getattr(hf_encoder, "layer", None)
-            or getattr(hf_encoder, "layers", None)
-        )
-        if layers is not None:
-            for layer in list(layers)[: self.frozen_stages]:
-                layer.eval()
-                for p in layer.parameters():
-                    p.requires_grad = False
 
     def train(self, mode=True):
         super().train(mode)
@@ -279,24 +211,24 @@ class DINOv3Adapter(nn.Module):
 
     def _load_weights(self, weights_path):
         if not weights_path:
-            print("[DINOv3Adapter] pretrained=True but weights_path is empty; using initialized weights.")
             return
 
         path = Path(weights_path)
         if not path.exists():
             raise RuntimeError(f"DINOv3Adapter weights_path not found: {path}")
 
-        if path.suffix == ".safetensors":
+        weight_path = self._resolve_weight_path(path)
+        if weight_path.suffix == ".safetensors":
             try:
                 from safetensors.torch import load_file
             except Exception as exc:
                 raise RuntimeError("Loading .safetensors weights requires the safetensors package.") from exc
-            ckpt = load_file(str(path), device="cpu")
+            ckpt = load_file(str(weight_path), device="cpu")
         else:
             try:
-                ckpt = torch.load(path, map_location="cpu", weights_only=True)
+                ckpt = torch.load(weight_path, map_location="cpu", weights_only=True)
             except TypeError:
-                ckpt = torch.load(path, map_location="cpu")
+                ckpt = torch.load(weight_path, map_location="cpu")
 
         raw_state = _unwrap_checkpoint(ckpt)
         state = {}
@@ -311,7 +243,7 @@ class DINOv3Adapter(nn.Module):
 
         incompatible = self.backbone.load_state_dict(state, strict=False)
         print(
-            "[DINOv3Adapter] Loaded weights with strict=False: "
+            f"[DINOv3Adapter] Loaded timm DINOv3 weights from {weight_path} with strict=False: "
             f"missing={len(incompatible.missing_keys)}, "
             f"unexpected={len(incompatible.unexpected_keys)}"
         )
@@ -320,25 +252,44 @@ class DINOv3Adapter(nn.Module):
         if incompatible.unexpected_keys:
             print(f"[DINOv3Adapter] First unexpected keys: {incompatible.unexpected_keys[:8]}")
 
-    def _forward_intermediate(self, x):
-        if self.source in ("huggingface", "hf"):
-            outputs = self.backbone(pixel_values=x, output_hidden_states=True, return_dict=True)
-            hidden_states = getattr(outputs, "hidden_states", None)
-            if hidden_states is not None:
-                offset = 1 if len(hidden_states) > max(self.out_indices) + 1 else 0
-                return [hidden_states[i + offset] for i in self.out_indices]
-            return [outputs.last_hidden_state]
+    @staticmethod
+    def _resolve_weight_path(path: Path) -> Path:
+        if path.is_file():
+            return path
+        candidates = [
+            "model.safetensors",
+            "pytorch_model.bin",
+            "checkpoint.pth",
+            "model.pth",
+        ]
+        for name in candidates:
+            candidate = path / name
+            if candidate.exists():
+                return candidate
+        for suffix in ("*.safetensors", "*.bin", "*.pth", "*.pt"):
+            matches = sorted(path.glob(suffix))
+            if matches:
+                return matches[0]
+        raise RuntimeError(f"No supported weight file found in directory: {path}")
 
-        if hasattr(self.backbone, "get_intermediate_layers"):
+    def _forward_intermediate(self, x):
+        if hasattr(self.backbone, "forward_intermediates"):
             try:
-                return self.backbone.get_intermediate_layers(
-                    x, n=self.out_indices, reshape=False, return_class_token=False
+                return self.backbone.forward_intermediates(
+                    x,
+                    indices=self.out_indices,
+                    return_prefix_tokens=False,
+                    output_fmt="NCHW",
+                    intermediates_only=True,
                 )
             except TypeError:
-                try:
-                    return self.backbone.get_intermediate_layers(x, n=self.out_indices, reshape=False)
-                except TypeError:
-                    return self.backbone.get_intermediate_layers(x, n=len(self.out_indices))
+                _, intermediates = self.backbone.forward_intermediates(
+                    x,
+                    indices=self.out_indices,
+                    return_prefix_tokens=False,
+                    output_fmt="NCHW",
+                )
+                return intermediates
 
         if hasattr(self.backbone, "forward_features"):
             out = self.backbone.forward_features(x)

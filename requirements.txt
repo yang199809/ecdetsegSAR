@@ -7,7 +7,7 @@ PyYAML
 tensorboard
 scipy==1.16.0
 calflops
-transformers>=4.56.0
+timm>=1.0.20
 huggingface_hub
 safetensors
 tabulate

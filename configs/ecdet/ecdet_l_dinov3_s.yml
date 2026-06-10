@@ -12,9 +12,16 @@ ECDet:
 
 DINOv3Adapter:
   name: dinov3_vits16
+  source: huggingface
+  hf_model_id: facebook/dinov3-vits16-pretrain-lvd1689m
+  hf_cache_dir: weights/hf_cache
+  local_files_only: False
+  trust_remote_code: False
   pretrained: True
-  weights_path: weights/dinov3_vits16.pth
+  weights_path: weights/dinov3-vits16-pretrain-lvd1689m
   embed_dim: 384
+  num_heads: 6
+  num_register_tokens: 4
   proj_dim: 256
   out_indices: [5, 8, 11]
   patch_size: 16

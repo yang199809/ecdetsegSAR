@@ -7,7 +7,9 @@ PyYAML
 tensorboard
 scipy==1.16.0
 calflops
-transformers
+transformers>=4.56.0
+huggingface_hub
+safetensors
 tabulate
 onnx==1.19.0
 onnxruntime

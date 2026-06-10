@@ -19,9 +19,13 @@ def main():
 
     backbone = DINOv3Adapter(
         name="dinov3_vits16",
+        source="huggingface",
+        hf_model_id="facebook/dinov3-vits16-pretrain-lvd1689m",
         pretrained=False,
         weights_path=None,
         embed_dim=384,
+        num_heads=6,
+        num_register_tokens=4,
         proj_dim=256,
         out_indices=[5, 8, 11],
         patch_size=16,

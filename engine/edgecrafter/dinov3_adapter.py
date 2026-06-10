@@ -2,11 +2,8 @@
 DINOv3 adapter for ECDet.
 
 This module keeps the ECDet neck/decoder contract unchanged by converting
-DINOv3/ViT-S patch tokens into three 256-channel feature maps at strides
-8, 16, and 32. The official DINOv3 builder API may vary by weight source;
-the builder below is intentionally defensive and falls back to the local
-ViT-S/16 implementation for shape tests when an external DINOv3 package is
-not available.
+Hugging Face DINOv3/ViT-S patch tokens into three 256-channel feature maps
+at strides 8, 16, and 32.
 """
 
 from pathlib import Path
@@ -23,16 +20,19 @@ from .hybrid_encoder import ConvNormLayer_fuse
 __all__ = ["DINOv3Adapter"]
 
 
-def _strip_known_prefixes(key: str) -> str:
-    prefixes = ("module.", "model.", "backbone.", "teacher.", "student.")
+def _candidate_keys(key: str) -> List[str]:
+    prefixes = ("module.", "backbone.", "teacher.", "student.", "model.")
+    candidates = [key]
     changed = True
+    current = key
     while changed:
         changed = False
         for prefix in prefixes:
-            if key.startswith(prefix):
-                key = key[len(prefix):]
+            if current.startswith(prefix):
+                current = current[len(prefix):]
+                candidates.append(current)
                 changed = True
-    return key
+    return candidates
 
 
 def _is_tensor_state_dict(value: Any) -> bool:
@@ -67,9 +67,16 @@ class DINOv3Adapter(nn.Module):
     def __init__(
         self,
         name="dinov3_vits16",
+        source="huggingface",
+        hf_model_id="facebook/dinov3-vits16-pretrain-lvd1689m",
+        hf_cache_dir=None,
+        local_files_only=False,
+        trust_remote_code=False,
         weights_path=None,
         pretrained=True,
         embed_dim=384,
+        num_heads=6,
+        num_register_tokens=4,
         proj_dim=256,
         out_indices=[5, 8, 11],
         patch_size=16,
@@ -87,30 +94,145 @@ class DINOv3Adapter(nn.Module):
             raise NotImplementedError("DINOv3Adapter currently outputs strides [8, 16, 32].")
 
         self.name = name
+        self.source = source
+        self.hf_model_id = hf_model_id
+        self.hf_cache_dir = hf_cache_dir
+        self.local_files_only = local_files_only
+        self.trust_remote_code = trust_remote_code
         self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.num_register_tokens = num_register_tokens
         self.proj_dim = proj_dim
         self.out_indices = list(out_indices)
         self.patch_size = patch_size
         self.out_strides = list(out_strides)
         self.frozen_stages = frozen_stages
         self.use_checkpoint = use_checkpoint
+        self._weights_loaded_by_builder = False
 
-        self.backbone = self._build_backbone(drop_path_rate=drop_path_rate, **kwargs)
+        self.backbone = self._build_backbone(
+            pretrained=pretrained and not skip_load_backbone,
+            drop_path_rate=drop_path_rate,
+            weights_path=weights_path,
+            **kwargs,
+        )
+        self._sync_backbone_dims()
         self.projector = nn.ModuleList([
-            ConvNormLayer_fuse(embed_dim, proj_dim, kernel_size=1, stride=1, act="silu")
+            ConvNormLayer_fuse(self.embed_dim, proj_dim, kernel_size=1, stride=1, act="silu")
             for _ in self.out_strides
         ])
 
         self._apply_checkpoint_flag()
         self._freeze_stages()
 
-        if pretrained and not skip_load_backbone:
+        if pretrained and not skip_load_backbone and not self._weights_loaded_by_builder:
             self._load_weights(weights_path)
 
-    def _build_backbone(self, drop_path_rate=0.0, **kwargs):
-        # Prefer a local or installed DINOv3 builder if one is available. The
-        # exact official API can differ across releases, so we keep this small
-        # and fall back to the repo-local ViT-S/16 implementation.
+    def _build_backbone(self, pretrained=True, drop_path_rate=0.0, weights_path=None, **kwargs):
+        if self.source in ("huggingface", "hf"):
+            return self._build_hf_backbone(
+                pretrained=pretrained,
+                drop_path_rate=drop_path_rate,
+                weights_path=weights_path,
+                **kwargs,
+            )
+
+        if self.source == "official":
+            return self._build_official_backbone(**kwargs)
+
+        if self.source != "local":
+            raise ValueError("DINOv3Adapter source must be one of: huggingface, official, local.")
+
+        print(
+            "[DINOv3Adapter] Using the repo-local ViT-S/16-compatible fallback. "
+            "This is useful for shape tests, but it is not the official "
+            "Hugging Face DINOv3 implementation."
+        )
+        return VisionTransformer(
+            embed_dim=self.embed_dim,
+            num_heads=self.num_heads,
+            return_layers=self.out_indices,
+            patch_size=self.patch_size,
+            embed_layer=PatchEmbed,
+            drop_path_rate=drop_path_rate,
+            **kwargs,
+        )
+
+    def _build_hf_backbone(self, pretrained=True, drop_path_rate=0.0, weights_path=None, **kwargs):
+        try:
+            from transformers import AutoModel
+        except Exception as exc:
+            raise RuntimeError(
+                "DINOv3Adapter(source='huggingface') requires transformers with DINOv3 support "
+                "(transformers>=4.56.0 is recommended)."
+            ) from exc
+
+        path = Path(weights_path) if weights_path else None
+
+        if path is not None and path.is_dir():
+            try:
+                model = AutoModel.from_pretrained(
+                    str(path),
+                    cache_dir=self.hf_cache_dir,
+                    local_files_only=self.local_files_only,
+                    trust_remote_code=self.trust_remote_code,
+                    output_hidden_states=True,
+                    **kwargs,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to load DINOv3 from Hugging Face. Check network/access permissions, "
+                    f"hf_model_id={self.hf_model_id}, weights_path={weights_path}, "
+                    f"local_files_only={self.local_files_only}."
+                ) from exc
+            self._weights_loaded_by_builder = True
+            return model
+
+        if path is not None and path.is_file():
+            return self._build_hf_model_from_config(drop_path_rate=drop_path_rate, **kwargs)
+
+        if pretrained:
+            try:
+                model = AutoModel.from_pretrained(
+                    self.hf_model_id,
+                    cache_dir=self.hf_cache_dir,
+                    local_files_only=self.local_files_only,
+                    trust_remote_code=self.trust_remote_code,
+                    output_hidden_states=True,
+                    **kwargs,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to download/load DINOv3 from Hugging Face. Check network/access permissions, "
+                    f"hf_model_id={self.hf_model_id}, local_files_only={self.local_files_only}."
+                ) from exc
+            self._weights_loaded_by_builder = True
+            return model
+
+        return self._build_hf_model_from_config(drop_path_rate=drop_path_rate, **kwargs)
+
+    def _build_hf_model_from_config(self, drop_path_rate=0.0, **kwargs):
+        try:
+            from transformers import DINOv3ViTConfig, DINOv3ViTModel
+        except Exception as exc:
+            raise RuntimeError(
+                "Random DINOv3 construction requires transformers>=4.56.0 with "
+                "DINOv3ViTConfig/DINOv3ViTModel."
+            ) from exc
+
+        config = DINOv3ViTConfig(
+            image_size=kwargs.pop("image_size", 640),
+            patch_size=self.patch_size,
+            hidden_size=self.embed_dim,
+            num_hidden_layers=max(self.out_indices) + 1,
+            num_attention_heads=self.num_heads,
+            num_register_tokens=self.num_register_tokens,
+            drop_path_rate=drop_path_rate,
+            output_hidden_states=True,
+        )
+        return DINOv3ViTModel(config)
+
+    def _build_official_backbone(self, **kwargs):
         try:
             import dinov3  # type: ignore  # noqa: F401
             from dinov3.hub.backbones import dinov3_vits16  # type: ignore
@@ -120,23 +242,30 @@ class DINOv3Adapter(nn.Module):
         except Exception as exc:
             print(f"[DINOv3Adapter] External DINOv3 builder is unavailable: {exc}")
 
-        print(
-            "[DINOv3Adapter] Using the local ViT-S/16-compatible fallback. "
-            "For official DINOv3 weights, install the matching DINOv3 code "
-            "or adapt _build_backbone to that weight source."
+        raise RuntimeError(
+            "DINOv3Adapter(source='official') requires the official facebookresearch/dinov3 "
+            "code to be importable."
         )
-        return VisionTransformer(
-            embed_dim=self.embed_dim,
-            num_heads=6,
-            return_layers=self.out_indices,
-            patch_size=self.patch_size,
-            embed_layer=PatchEmbed,
-            drop_path_rate=drop_path_rate,
-            **kwargs,
-        )
+
+    def _sync_backbone_dims(self):
+        config = getattr(self.backbone, "config", None)
+        hidden_size = getattr(config, "hidden_size", None)
+        if hidden_size is not None and hidden_size != self.embed_dim:
+            print(f"[DINOv3Adapter] Using backbone hidden_size={hidden_size} instead of embed_dim={self.embed_dim}.")
+            self.embed_dim = hidden_size
+
+        patch_size = getattr(config, "patch_size", None)
+        if isinstance(patch_size, (tuple, list)):
+            patch_size = patch_size[0]
+        if patch_size is not None and patch_size != self.patch_size:
+            print(f"[DINOv3Adapter] Using backbone patch_size={patch_size} instead of patch_size={self.patch_size}.")
+            self.patch_size = patch_size
 
     def _apply_checkpoint_flag(self):
         if not self.use_checkpoint:
+            return
+        if hasattr(self.backbone, "gradient_checkpointing_enable"):
+            self.backbone.gradient_checkpointing_enable()
             return
         for module in self.backbone.modules():
             if hasattr(module, "use_checkpoint"):
@@ -145,6 +274,10 @@ class DINOv3Adapter(nn.Module):
     def _freeze_stages(self):
         if self.frozen_stages < 0:
             return
+        if hasattr(self.backbone, "embeddings"):
+            self.backbone.embeddings.eval()
+            for p in self.backbone.embeddings.parameters():
+                p.requires_grad = False
         if hasattr(self.backbone, "patch_embed"):
             self.backbone.patch_embed.eval()
             for p in self.backbone.patch_embed.parameters():
@@ -154,6 +287,19 @@ class DINOv3Adapter(nn.Module):
             for block in list(blocks)[: self.frozen_stages]:
                 block.eval()
                 for p in block.parameters():
+                    p.requires_grad = False
+        encoder = getattr(self.backbone, "encoder", None)
+        hf_encoder = getattr(self.backbone, "model", None)
+        layers = (
+            getattr(encoder, "layer", None)
+            or getattr(encoder, "layers", None)
+            or getattr(hf_encoder, "layer", None)
+            or getattr(hf_encoder, "layers", None)
+        )
+        if layers is not None:
+            for layer in list(layers)[: self.frozen_stages]:
+                layer.eval()
+                for p in layer.parameters():
                     p.requires_grad = False
 
     def train(self, mode=True):
@@ -171,18 +317,27 @@ class DINOv3Adapter(nn.Module):
             print(f"[DINOv3Adapter] weights_path not found: {path}; using initialized weights.")
             return
 
-        try:
-            ckpt = torch.load(path, map_location="cpu", weights_only=True)
-        except TypeError:
-            ckpt = torch.load(path, map_location="cpu")
+        if path.suffix == ".safetensors":
+            try:
+                from safetensors.torch import load_file
+            except Exception as exc:
+                raise RuntimeError("Loading .safetensors weights requires the safetensors package.") from exc
+            ckpt = load_file(str(path), device="cpu")
+        else:
+            try:
+                ckpt = torch.load(path, map_location="cpu", weights_only=True)
+            except TypeError:
+                ckpt = torch.load(path, map_location="cpu")
 
         raw_state = _unwrap_checkpoint(ckpt)
         state = {}
+        target_keys = set(self.backbone.state_dict().keys())
         ignored_prefixes = ("head.", "fc.", "classifier.")
         for key, value in raw_state.items():
-            clean_key = _strip_known_prefixes(key)
-            if clean_key.startswith(ignored_prefixes):
+            candidates = _candidate_keys(key)
+            if any(candidate.startswith(ignored_prefixes) for candidate in candidates):
                 continue
+            clean_key = next((candidate for candidate in candidates if candidate in target_keys), candidates[-1])
             state[clean_key] = value
 
         incompatible = self.backbone.load_state_dict(state, strict=False)
@@ -197,6 +352,14 @@ class DINOv3Adapter(nn.Module):
             print(f"[DINOv3Adapter] First unexpected keys: {incompatible.unexpected_keys[:8]}")
 
     def _forward_intermediate(self, x):
+        if self.source in ("huggingface", "hf"):
+            outputs = self.backbone(pixel_values=x, output_hidden_states=True, return_dict=True)
+            hidden_states = getattr(outputs, "hidden_states", None)
+            if hidden_states is not None:
+                offset = 1 if len(hidden_states) > max(self.out_indices) + 1 else 0
+                return [hidden_states[i + offset] for i in self.out_indices]
+            return [outputs.last_hidden_state]
+
         if hasattr(self.backbone, "get_intermediate_layers"):
             try:
                 return self.backbone.get_intermediate_layers(

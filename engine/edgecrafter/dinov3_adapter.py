@@ -14,7 +14,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..core import register
-from .ecvit import PatchEmbed, VisionTransformer
 from .hybrid_encoder import ConvNormLayer_fuse
 
 __all__ = ["DINOv3Adapter"]
@@ -110,7 +109,7 @@ class DINOv3Adapter(nn.Module):
         self.use_checkpoint = use_checkpoint
         self._weights_loaded_by_builder = False
 
-        self.backbone = self._build_backbone(
+        self.backbone = self._build_hf_backbone(
             pretrained=pretrained and not skip_load_backbone,
             drop_path_rate=drop_path_rate,
             weights_path=weights_path,
@@ -128,37 +127,13 @@ class DINOv3Adapter(nn.Module):
         if pretrained and not skip_load_backbone and not self._weights_loaded_by_builder:
             self._load_weights(weights_path)
 
-    def _build_backbone(self, pretrained=True, drop_path_rate=0.0, weights_path=None, **kwargs):
-        if self.source in ("huggingface", "hf"):
-            return self._build_hf_backbone(
-                pretrained=pretrained,
-                drop_path_rate=drop_path_rate,
-                weights_path=weights_path,
-                **kwargs,
+    def _build_hf_backbone(self, pretrained=True, drop_path_rate=0.0, weights_path=None, **kwargs):
+        if self.source not in ("huggingface", "hf"):
+            raise ValueError(
+                "DINOv3Adapter now builds the backbone only from Hugging Face/Transformers. "
+                "Please set source: huggingface."
             )
 
-        if self.source == "official":
-            return self._build_official_backbone(**kwargs)
-
-        if self.source != "local":
-            raise ValueError("DINOv3Adapter source must be one of: huggingface, official, local.")
-
-        print(
-            "[DINOv3Adapter] Using the repo-local ViT-S/16-compatible fallback. "
-            "This is useful for shape tests, but it is not the official "
-            "Hugging Face DINOv3 implementation."
-        )
-        return VisionTransformer(
-            embed_dim=self.embed_dim,
-            num_heads=self.num_heads,
-            return_layers=self.out_indices,
-            patch_size=self.patch_size,
-            embed_layer=PatchEmbed,
-            drop_path_rate=drop_path_rate,
-            **kwargs,
-        )
-
-    def _build_hf_backbone(self, pretrained=True, drop_path_rate=0.0, weights_path=None, **kwargs):
         try:
             from transformers import AutoModel
         except Exception as exc:
@@ -181,15 +156,24 @@ class DINOv3Adapter(nn.Module):
                 )
             except Exception as exc:
                 raise RuntimeError(
-                    "Failed to load DINOv3 from Hugging Face. Check network/access permissions, "
-                    f"hf_model_id={self.hf_model_id}, weights_path={weights_path}, "
+                    "Failed to load local Hugging Face DINOv3 snapshot. "
+                    "The directory should contain config.json and model weights downloaded "
+                    f"from {self.hf_model_id}. weights_path={weights_path}, "
                     f"local_files_only={self.local_files_only}."
                 ) from exc
             self._weights_loaded_by_builder = True
+            print(f"[DINOv3Adapter] Loaded Hugging Face DINOv3 backbone from local directory: {path}")
             return model
 
         if path is not None and path.is_file():
+            print(f"[DINOv3Adapter] Building Hugging Face DINOv3 backbone and loading local weight file: {path}")
             return self._build_hf_model_from_config(drop_path_rate=drop_path_rate, **kwargs)
+
+        if pretrained and weights_path:
+            raise RuntimeError(
+                f"DINOv3Adapter pretrained=True but weights_path does not exist: {weights_path}. "
+                "Download the Hugging Face snapshot first, or point weights_path to a local .pth/.bin/.safetensors file."
+            )
 
         if pretrained:
             try:
@@ -207,6 +191,7 @@ class DINOv3Adapter(nn.Module):
                     f"hf_model_id={self.hf_model_id}, local_files_only={self.local_files_only}."
                 ) from exc
             self._weights_loaded_by_builder = True
+            print(f"[DINOv3Adapter] Downloaded/loaded Hugging Face DINOv3 backbone: {self.hf_model_id}")
             return model
 
         return self._build_hf_model_from_config(drop_path_rate=drop_path_rate, **kwargs)
@@ -231,21 +216,6 @@ class DINOv3Adapter(nn.Module):
             output_hidden_states=True,
         )
         return DINOv3ViTModel(config)
-
-    def _build_official_backbone(self, **kwargs):
-        try:
-            import dinov3  # type: ignore  # noqa: F401
-            from dinov3.hub.backbones import dinov3_vits16  # type: ignore
-
-            if self.name == "dinov3_vits16":
-                return dinov3_vits16(pretrained=False, weights=None, **kwargs)
-        except Exception as exc:
-            print(f"[DINOv3Adapter] External DINOv3 builder is unavailable: {exc}")
-
-        raise RuntimeError(
-            "DINOv3Adapter(source='official') requires the official facebookresearch/dinov3 "
-            "code to be importable."
-        )
 
     def _sync_backbone_dims(self):
         config = getattr(self.backbone, "config", None)
@@ -314,8 +284,7 @@ class DINOv3Adapter(nn.Module):
 
         path = Path(weights_path)
         if not path.exists():
-            print(f"[DINOv3Adapter] weights_path not found: {path}; using initialized weights.")
-            return
+            raise RuntimeError(f"DINOv3Adapter weights_path not found: {path}")
 
         if path.suffix == ".safetensors":
             try:

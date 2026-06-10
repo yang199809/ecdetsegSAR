@@ -14,6 +14,9 @@ from engine.edgecrafter import DINOv3Adapter, HybridEncoder  # noqa: E402
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--weights-path", default=None)
+    parser.add_argument("--pretrained", action="store_true")
+    parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--skip-encoder", action="store_true")
     args = parser.parse_args()
 
@@ -21,8 +24,9 @@ def main():
         name="dinov3_vits16",
         source="huggingface",
         hf_model_id="facebook/dinov3-vits16-pretrain-lvd1689m",
-        pretrained=False,
-        weights_path=None,
+        pretrained=args.pretrained,
+        weights_path=args.weights_path,
+        local_files_only=args.local_files_only,
         embed_dim=384,
         num_heads=6,
         num_register_tokens=4,

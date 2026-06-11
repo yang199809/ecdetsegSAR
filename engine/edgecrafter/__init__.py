@@ -9,7 +9,7 @@ Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 
 from .criterion import ECCriterion
 from .decoder import ECTransformer
-from .dinov3_adapter import DINOv3Adapter
+from .dinov3_adapter import DINOv3STAs
 from .ecvit import ViTAdapter
 from .hybrid_encoder import HybridEncoder
 from .matcher import HungarianMatcher

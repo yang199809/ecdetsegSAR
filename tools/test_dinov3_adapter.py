@@ -14,20 +14,18 @@ from engine.edgecrafter import DINOv3Adapter, HybridEncoder  # noqa: E402
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--weights-path", default=None)
-    parser.add_argument("--pretrained", action="store_true")
     parser.add_argument("--skip-encoder", action="store_true")
     args = parser.parse_args()
 
     backbone = DINOv3Adapter(
         name="dinov3_vits16",
-        source="timm",
-        timm_model_name="vit_small_patch16_dinov3.lvd1689m",
-        hf_model_id="timm/vit_small_patch16_dinov3.lvd1689m",
-        pretrained=args.pretrained,
-        weights_path=args.weights_path,
+        source="huggingface",
+        hf_model_id="facebook/dinov3-vits16-pretrain-lvd1689m",
+        pretrained=False,
+        weights_path=None,
         embed_dim=384,
         num_heads=6,
+        num_register_tokens=4,
         proj_dim=256,
         out_indices=[5, 8, 11],
         patch_size=16,

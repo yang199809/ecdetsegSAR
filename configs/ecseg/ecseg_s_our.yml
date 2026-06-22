@@ -9,6 +9,9 @@ output_dir: outputs/ecseg_s_0.003
 ViTAdapter:
   name: ecseg_vitt
   weights_path: ecvits/ecseg_vitt.pth
+  use_fsem: True
+  fsem_use_fsas: [False, True, True]
+  fsem_aux_loss: True
 
 optimizer:
   type: AdamW

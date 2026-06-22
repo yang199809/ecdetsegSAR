@@ -272,6 +272,49 @@ class ECCriterion(nn.Module):
 
         return losses
 
+    def loss_freq_obj(self, outputs, targets, indices, num_boxes):
+        """Supervise O-SAFSEM object maps with the union of instance masks."""
+        if "fsem_aux" not in outputs:
+            device = outputs["pred_logits"].device
+            return {"loss_freq_obj": torch.tensor(0.0, device=device)}
+
+        object_maps = outputs["fsem_aux"]["object_maps"]
+        if len(object_maps) == 0:
+            device = outputs["pred_logits"].device
+            return {"loss_freq_obj": torch.tensor(0.0, device=device)}
+
+        losses = []
+        for obj_map in object_maps:
+            _, _, height, width = obj_map.shape
+            gt_maps = []
+            for target in targets:
+                if "masks" in target and target["masks"].numel() > 0:
+                    mask_union = target["masks"].float().max(dim=0, keepdim=True)[0]
+                else:
+                    mask_union = torch.zeros(
+                        1,
+                        height,
+                        width,
+                        device=obj_map.device,
+                        dtype=obj_map.dtype,
+                    )
+
+                mask_union = mask_union.unsqueeze(0).to(
+                    device=obj_map.device,
+                    dtype=obj_map.dtype,
+                )
+                mask_union = F.interpolate(
+                    mask_union,
+                    size=(height, width),
+                    mode="nearest",
+                )
+                gt_maps.append(mask_union.squeeze(0))
+
+            gt_maps = torch.stack(gt_maps, dim=0)
+            losses.append(F.binary_cross_entropy(obj_map, gt_maps, reduction="mean"))
+
+        return {"loss_freq_obj": sum(losses) / len(losses)}
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -317,7 +360,8 @@ class ECCriterion(nn.Module):
             'vfl': self.loss_labels_vfl,
             'mal': self.loss_labels_mal,
             'local': self.loss_local,
-            'masks': self.loss_masks
+            'masks': self.loss_masks,
+            'freq_obj': self.loss_freq_obj,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)

@@ -11,6 +11,7 @@ from .criterion import ECCriterion
 from .decoder import ECTransformer
 from .dinov3_adapter import DINOv3STAs
 from .ecvit import ViTAdapter
+from .fsem import OSAFSEMBlock
 from .hybrid_encoder import HybridEncoder
 from .matcher import HungarianMatcher
 from .modeling import ECDet, ECSeg

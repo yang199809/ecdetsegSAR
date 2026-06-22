@@ -20,9 +20,14 @@ class _ECBase(nn.Module):
         self.decoder = decoder
 
     def forward_features(self, x):
+        fsem_aux = None
         x = self.backbone(x)
+
+        if isinstance(x, tuple) and len(x) == 2:
+            x, fsem_aux = x
+
         x = self.encoder(x)
-        return x
+        return x, fsem_aux
 
     def deploy(self):
         self.eval()
@@ -36,14 +41,24 @@ class _ECBase(nn.Module):
 class ECDet(_ECBase):
 
     def forward(self, x, targets=None):
-        x = self.forward_features(x)
-        return self.decoder(x, targets)
+        x, fsem_aux = self.forward_features(x)
+        outputs = self.decoder(x, targets)
+
+        if self.training and fsem_aux is not None and isinstance(outputs, dict):
+            outputs["fsem_aux"] = fsem_aux
+
+        return outputs
 
 
 @register()
 class ECSeg(_ECBase):
 
     def forward(self, x, targets=None):
-        x = self.forward_features(x)
+        x, fsem_aux = self.forward_features(x)
         spatial_feat = x[0]
-        return self.decoder(x, targets, spatial_feat)
+        outputs = self.decoder(x, targets, spatial_feat)
+
+        if self.training and fsem_aux is not None and isinstance(outputs, dict):
+            outputs["fsem_aux"] = fsem_aux
+
+        return outputs

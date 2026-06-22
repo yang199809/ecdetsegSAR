@@ -20,6 +20,7 @@ from torch import nn
 
 from ..core import register
 from ..misc import dist_utils
+from .fsem import OSAFSEMBlock
 from .hybrid_encoder import ConvNormLayer_fuse
 
 __all__ = ['ViTAdapter', ]
@@ -382,6 +383,9 @@ class ViTAdapter(nn.Module):
         ffn_layer='mlp',
         ffn_ratio=4,
         skip_load_backbone=False,
+        use_fsem=False,
+        fsem_use_fsas=[False, True, True],
+        fsem_aux_loss=True,
         **kwargs
     ):
         super().__init__()
@@ -417,6 +421,19 @@ class ViTAdapter(nn.Module):
         self.proj_dim = [proj_dim] * num_levels if proj_dim is not None else [embed_dim]
 
         self.projector = nn.ModuleList([ConvNormLayer_fuse(embed_dim, dim, kernel_size=1, stride=1) for dim in self.proj_dim])
+
+        self.use_fsem = use_fsem
+        self.fsem_aux_loss = fsem_aux_loss
+        if self.use_fsem:
+            assert len(fsem_use_fsas) == num_levels
+            self.fsem_blocks = nn.ModuleList([
+                OSAFSEMBlock(
+                    dim=embed_dim,
+                    use_fsas=fsem_use_fsas[i],
+                    act="silu",
+                )
+                for i in range(num_levels)
+            ])
         
     def _load_weights(self, weights_path):
         if self.name not in self.ecvit_url:
@@ -490,12 +507,37 @@ class ViTAdapter(nn.Module):
             resize_W = int(W_c * scale)
             feature = F.interpolate(fused_feats, size=[resize_H, resize_W], mode="bilinear", align_corners=False)
             proj_feats.append(feature)
+
+        fsem_aux = None
+        if self.use_fsem:
+            new_feats = []
+            object_maps = []
+            band_weights = []
+            return_aux = self.training and self.fsem_aux_loss
+
+            for feat, fsem in zip(proj_feats, self.fsem_blocks):
+                if return_aux:
+                    feat, aux = fsem(feat, return_aux=True)
+                    object_maps.append(aux["object_map"])
+                    band_weights.append(aux["band_weight"])
+                else:
+                    feat = fsem(feat, return_aux=False)
+                new_feats.append(feat)
+
+            proj_feats = new_feats
+            if return_aux:
+                fsem_aux = {
+                    "object_maps": object_maps,
+                    "band_weights": band_weights,
+                }
             
         if len(self.projector) == 1:
             proj_feats[-1] = self.projector[-1](proj_feats[-1])
         else:
             proj_feats = [layer(feat) for layer, feat in zip(self.projector, proj_feats)]
             
+        if fsem_aux is not None:
+            return proj_feats, fsem_aux
         return proj_feats
         
     

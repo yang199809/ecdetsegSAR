@@ -1,14 +1,17 @@
 __include__: [
-  '../dataset/custom.yml',
-  '../ecdet/ecdet_s.yml',
+  '../dataset/custom_ssdd.yml',
+  '../ecdet/ecdet_s_ssdd.yml',
   'ecseg.yml',
 ]
 
-output_dir: outputs/ecseg_s_0.003
+output_dir: outputs/ecseg_s_ssdd_0.0004_newpyramid_FSEM_v1_stem
 
 ViTAdapter:
   name: ecseg_vitt
   weights_path: ecvits/ecseg_vitt.pth
+  use_sta: True
+  conv_inplane: 32
+
 
 optimizer:
   type: AdamW
@@ -17,17 +20,17 @@ optimizer:
     -
       # except norm/bn/bias in backbone
       params: '^(?=.*.backbone)(?!.*(?:norm|bn|bias)).*$'
-      lr: 0.000015
+      lr: 0.00002
     -
       # including all norm/bn/bias in backbone
       params: '^(?=.*.backbone)(?=.*(?:norm|bn|bias)).*$'
-      lr: 0.000015
+      lr: 0.00002
       weight_decay: 0.
     -
       # including all norm/bn/bias except for the backbone
       params: '^(?!.*\.backbone)(?=.*(?:norm|bn|bias)).*$'
       weight_decay: 0.
 
-  lr: 0.0003
+  lr: 0.0004
   betas: [0.9, 0.999]
   weight_decay: 0.0001

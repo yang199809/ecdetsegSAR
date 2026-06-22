@@ -12,8 +12,8 @@ train_dataloader:
   type: DataLoader
   dataset:
     type: CocoDetection
-    img_folder: /home/shuangy/EdgeCrafter-main/ecdetseg/data/hrsid/images
-    ann_file: /home/shuangy/EdgeCrafter-main/ecdetseg/data/hrsid/annotations/train2017_fixed.json
+    img_folder: /home/shuangy/EdgeCrafter-main/ecdetseg/data/ssdd/images/train
+    ann_file: /home/shuangy/EdgeCrafter-main/ecdetseg/data/ssdd/annotations/train.json
     return_masks: False
     transforms:
       type: Compose
@@ -29,8 +29,8 @@ val_dataloader:
   type: DataLoader
   dataset:
     type: CocoDetection
-    img_folder: /home/shuangy/EdgeCrafter-main/ecdetseg/data/hrsid/images
-    ann_file: /home/shuangy/EdgeCrafter-main/ecdetseg/data/hrsid/annotations/test2017_fixed.json
+    img_folder: /home/shuangy/EdgeCrafter-main/ecdetseg/data/ssdd/images/test
+    ann_file: /home/shuangy/EdgeCrafter-main/ecdetseg/data/ssdd/annotations/test.json
     return_masks: False
     transforms:
       type: Compose

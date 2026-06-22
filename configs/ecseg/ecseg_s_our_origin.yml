@@ -1,14 +1,15 @@
 __include__: [
   '../dataset/custom_ssdd.yml',
-  '../ecdet/ecdet_m_ssdd.yml',
+  '../ecdet/ecdet_s_ssdd.yml',
   'ecseg.yml',
 ]
 
-output_dir: outputs/ecseg_m_ssdd_0.0003_74
+output_dir: outputs/ecseg_s_ssdd_0.0004_newpyramid
 
 ViTAdapter:
-  name: ecseg_vittplus
-  weights_path: ecvits/ecseg_vittplus.pth
+  name: ecseg_vitt
+  weights_path: ecvits/ecseg_vitt.pth
+
 
 
 optimizer:

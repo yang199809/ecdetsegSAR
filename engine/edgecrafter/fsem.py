@@ -70,10 +70,9 @@ class LayerNorm2d(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        mean = x.mean(dim=1, keepdim=True)
-        variance = (x - mean).pow(2).mean(dim=1, keepdim=True)
-        x = (x - mean) * torch.rsqrt(variance + self.eps)
-        return x * self.weight[:, None, None] + self.bias[:, None, None]
+        x = x.permute(0, 2, 3, 1)
+        x = F.layer_norm(x, (x.shape[-1],), self.weight, self.bias, self.eps)
+        return x.permute(0, 3, 1, 2)
 
 
 class SpatialBranch(nn.Module):
@@ -211,17 +210,19 @@ class FSASBranch(nn.Module):
             act=act,
         )
         self.corr_norm = LayerNorm2d(dim)
-        self.temperature = nn.Parameter(torch.ones(1, dim, 1, 1))
+        self.log_scale = nn.Parameter(torch.zeros(1))
         self.out_proj = ConvNormLayer_fuse(dim, dim, 1, 1, padding=0, act=act)
 
     def forward(self, x):
+        dtype = x.dtype
         q, k, v = self.qkv_dw(self.qkv_pw(x)).chunk(3, dim=1)
         h, w = x.shape[-2:]
         qf = torch.fft.rfft2(q.float(), norm="ortho")
         kf = torch.fft.rfft2(k.float(), norm="ortho")
         corr = torch.fft.irfft2(qf * torch.conj(kf), s=(h, w), norm="ortho")
-        corr = self.corr_norm(corr)
-        corr = torch.sigmoid(corr / self.temperature.clamp(min=0.1))
+        corr = self.corr_norm(corr.to(dtype))
+        scale_factor = torch.exp(0.5 * torch.tanh(self.log_scale))
+        corr = torch.sigmoid(corr * scale_factor)
         return self.out_proj(v * corr.to(dtype=v.dtype))
 
 

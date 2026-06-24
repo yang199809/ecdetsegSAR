@@ -763,6 +763,7 @@ class FSEMBlock(nn.Module):
         freq_reconstruct: str = "idwt",
         act: str = "silu",
         init_scale: float = 1e-3,
+        use_ln: bool = False,
     ):
         super().__init__()
 
@@ -807,6 +808,7 @@ class FSEMBlock(nn.Module):
         )
 
         self.alpha = nn.Parameter(torch.ones(1) * init_scale)
+        self.out_norm = LayerNorm2d(out_dim) if use_ln else nn.Identity()
 
     def forward(self, x):
         x = self.pw(self.dw3(x))
@@ -818,7 +820,9 @@ class FSEMBlock(nn.Module):
 
         delta = self.fusion(torch.cat(feats, dim=1))
 
-        return x + self.alpha * delta
+        out = x + self.alpha * delta
+        out = self.out_norm(out)
+        return out
 
 class Stem(nn.Module):
     def __init__(self, in_channels, out_channels, use_norm=True):
@@ -846,17 +850,17 @@ class Stem(nn.Module):
         return out
 
 class SpatialFreqModule(nn.Module):
-    def __init__(self, inplanes=16):
+    def __init__(self, inplanes=16, use_fsem_ln: bool = False):
         super().__init__()
 
         # 1/4
         self.stem = Stem(3, inplanes, use_norm=True)
         # 1/8
-        self.conv2 = FSEMBlock(inplanes, out_dim= 2 * inplanes, use_fsas=False)
+        self.conv2 = FSEMBlock(inplanes, out_dim= 2 * inplanes, use_fsas=False, use_ln=use_fsem_ln)
         # 1/16
-        self.conv3 = FSEMBlock(2 * inplanes, out_dim= 4 * inplanes, use_fsas=False)
+        self.conv3 = FSEMBlock(2 * inplanes, out_dim= 4 * inplanes, use_fsas=False, use_ln=use_fsem_ln)
         # 1/32
-        self.conv4 = FSEMBlock(4 * inplanes, out_dim= 4 * inplanes, use_fsas=True)
+        self.conv4 = FSEMBlock(4 * inplanes, out_dim= 4 * inplanes, use_fsas=True, use_ln=use_fsem_ln)
 
     def forward(self, x):
         c1 = self.stem(x)
@@ -896,6 +900,7 @@ class ViTAdapter(nn.Module):
         embed_layer='ConvPyramidPatchEmbed',
         use_sta=True,
         conv_inplane=16,
+        use_fsem_ln=False,
         hidden_dim=None,
         ffn_layer='mlp',
         ffn_ratio=4,
@@ -938,8 +943,11 @@ class ViTAdapter(nn.Module):
 
         self.use_sta = use_sta
         if use_sta:
-            print(f"Using Lite Spatial Prior Module with inplanes={conv_inplane}")
-            self.sta = SpatialFreqModule(inplanes=conv_inplane)
+            print(f"Using Lite Spatial-Frequency Module with inplanes={conv_inplane}, use_fsem_ln={use_fsem_ln}")
+            self.sta = SpatialFreqModule(
+                inplanes=conv_inplane,
+                use_fsem_ln=use_fsem_ln,
+            )
         else:
             conv_inplane = 0
 

@@ -578,6 +578,91 @@ class FreqBranch(nn.Module):
         y = self.out_proj(y)
         return y
 
+
+# =========================================================
+# 4. Band-Decoupled Wavelet Branch
+# =========================================================
+
+class SpatialSubBandGate(nn.Module):
+    """Spatially preserved gate over LL/LH/HL/HH wavelet bands."""
+    def __init__(self, dim: int, reduction: int = 4):
+        super().__init__()
+        hidden = max(dim // reduction, 8)
+        self.gate = nn.Sequential(
+            nn.Conv2d(4 * dim, hidden, kernel_size=3, padding=1, bias=True),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, 4 * dim, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, bands):
+        return self.gate(bands)
+
+
+class BandDecoupledFreqBranch(nn.Module):
+    """
+    Band-decoupled wavelet branch:
+        DWT
+        -> spatial sub-band gate
+        -> independent LL/LH/HL/HH processing
+        -> IDWT
+        -> output projection
+    """
+    def __init__(self, dim: int, reduction: int = 4, act: str = "silu"):
+        super().__init__()
+        self.band_gate = SpatialSubBandGate(dim, reduction=reduction)
+        self.ll_branch = self._make_subband_branch(dim, act)
+        self.lh_branch = self._make_subband_branch(dim, act)
+        self.hl_branch = self._make_subband_branch(dim, act)
+        self.hh_branch = self._make_subband_branch(dim, act)
+        self.out_proj = ConvNormLayer_fuse(
+            dim,
+            dim,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            act=act,
+        )
+
+    @staticmethod
+    def _make_subband_branch(dim: int, act: str):
+        return nn.Sequential(
+            ConvNormLayer_fuse(
+                dim,
+                dim,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                act=act,
+            ),
+            ConvNormLayer_fuse(
+                dim,
+                dim,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                g=dim,
+                act=act,
+            ),
+        )
+
+    def forward(self, x):
+        bands, orig_hw = haar_dwt(x)
+        weights = self.band_gate(bands)
+
+        LL, LH, HL, HH = bands.chunk(4, dim=1)
+        w_LL, w_LH, w_HL, w_HH = weights.chunk(4, dim=1)
+
+        LL = self.ll_branch(LL * w_LL)
+        LH = self.lh_branch(LH * w_LH)
+        HL = self.hl_branch(HL * w_HL)
+        HH = self.hh_branch(HH * w_HH)
+
+        bands = torch.cat([LL, LH, HL, HH], dim=1)
+        y = haar_idwt(bands, orig_hw)
+        y = self.out_proj(y)
+        return y
+
 # =========================================================
 # 5. FSAS Branch
 # =========================================================
@@ -702,11 +787,11 @@ class FSEMBlock(nn.Module):
 
         self.spatial_branch = SpatialBranch(out_dim, act=act)
 
-        self.freq_branch = FreqBranch(
-            out_dim,
-            reconstruct=freq_reconstruct,
-            act=act,
-        ) if not use_fsas else FSASBranch(out_dim, act=act)
+        self.freq_branch = (
+            BandDecoupledFreqBranch(out_dim, act=act)
+            if not use_fsas
+            else FSASBranch(out_dim, act=act)
+        )
 
         fuse_in = out_dim * 2
 

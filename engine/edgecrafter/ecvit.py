@@ -582,6 +582,20 @@ class FreqBranch(nn.Module):
 # 5. FSAS Branch
 # =========================================================
 
+class LayerNorm2d(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        x = x.permute(0, 2, 3, 1)
+        x = F.layer_norm(x, (x.shape[-1],), self.weight, self.bias, self.eps)
+        x = x.permute(0, 3, 1, 2)
+        return x
+
+
 class FSASBranch(nn.Module):
     """
     FSAS-like branch:
@@ -612,8 +626,8 @@ class FSASBranch(nn.Module):
             bias=False,
         )
 
-        # EdgeCrafter mainly uses BatchNorm2d in conv feature branches.
-        self.corr_norm = nn.BatchNorm2d(dim)
+        self.corr_norm = LayerNorm2d(dim)
+        self.log_scale = nn.Parameter(torch.zeros(1))
 
         self.proj = ConvNormLayer_fuse(
             dim,
@@ -641,7 +655,8 @@ class FSASBranch(nn.Module):
         )
 
         corr = self.corr_norm(corr.to(dtype))
-        corr = torch.sigmoid(corr)
+        scale_factor = torch.exp(0.5 * torch.tanh(self.log_scale))
+        corr = torch.sigmoid(corr * scale_factor)
 
         y = v * corr
         y = self.proj(y)

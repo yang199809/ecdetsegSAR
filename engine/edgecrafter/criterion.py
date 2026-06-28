@@ -24,6 +24,7 @@ import torchvision
 from ..core import register
 from ..misc.dist_utils import get_world_size, is_dist_available_and_initialized
 from .box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
+from .fsqm import fsqm_auxiliary_loss
 from .segmentation_head import (get_uncertain_point_coords_with_randomness,
                                 point_sample)
 from .utils import bbox2distance
@@ -47,6 +48,10 @@ class ECCriterion(nn.Module):
         mal_alpha=None,
         use_uni_set=True,
         mask_point_sample_ratio=None,
+        use_fsqm=False,
+        fsqm_aux_weight=0.2,
+        fsqm_bg_weight=0.2,
+        fsqm_rho=0.15,
         ):
         super().__init__()
         self.num_classes = num_classes
@@ -64,6 +69,10 @@ class ECCriterion(nn.Module):
         self.mal_alpha = mal_alpha
         self.use_uni_set = use_uni_set
         self.mask_point_sample_ratio = matcher.mask_point_sample_ratio
+        self.use_fsqm = use_fsqm
+        self.fsqm_aux_weight = fsqm_aux_weight
+        self.fsqm_bg_weight = fsqm_bg_weight
+        self.fsqm_rho = fsqm_rho
 
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         assert 'pred_logits' in outputs
@@ -462,6 +471,19 @@ class ECCriterion(nn.Module):
                     l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                     l_dict = {k + '_dn_pre': v for k, v in l_dict.items()}
                     losses.update(l_dict)
+
+        if self.use_fsqm and 'fsqm_aux_outputs' in outputs:
+            fsqm_outputs = outputs['fsqm_aux_outputs']
+            losses.update(
+                fsqm_auxiliary_loss(
+                    fsqm_outputs,
+                    fsqm_outputs.get('images', None),
+                    targets,
+                    rho=self.fsqm_rho,
+                    bg_weight=self.fsqm_bg_weight,
+                    aux_weight=self.fsqm_aux_weight,
+                )
+            )
 
         # For debugging Objects365 pre-train.
         losses = {k:torch.nan_to_num(v, nan=0.0) for k, v in losses.items()}

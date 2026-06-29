@@ -446,6 +446,9 @@ class ECTransformer(nn.Module):
                  fsqm_query_dim=None,
                  fsqm_hidden_ratio=0.25,
                  fsqm_use_conf_gate=True,
+                 fsqm_use_modulation=True,
+                 fsqm_use_map_only=False,
+                 fsqm_modulation_target="query",
                  fsqm_max_gamma=0.05,
                  ):
         super().__init__()
@@ -468,6 +471,10 @@ class ECTransformer(nn.Module):
         self.aux_loss = aux_loss
         self.reg_max = reg_max
         self.use_fsqm = use_fsqm
+        self.fsqm_use_modulation = fsqm_use_modulation and not fsqm_use_map_only
+        self.fsqm_modulation_target = "none" if fsqm_use_map_only else fsqm_modulation_target
+        if self.fsqm_modulation_target == "none":
+            self.fsqm_use_modulation = False
 
         assert query_select_method in ('default', 'one2many', 'agnostic'), ''
         assert cross_attn_method in ('default', 'discrete'), ''
@@ -487,6 +494,8 @@ class ECTransformer(nn.Module):
                 fsqm_query_dim,
                 hidden_ratio=fsqm_hidden_ratio,
                 use_conf_gate=fsqm_use_conf_gate,
+                use_modulation=self.fsqm_use_modulation,
+                modulation_target=self.fsqm_modulation_target,
                 max_gamma=fsqm_max_gamma,
             )
         else:
@@ -772,6 +781,7 @@ class ECTransformer(nn.Module):
                 init_ref_contents,
                 proj_feats,
                 F.sigmoid(init_ref_points_unact),
+                images=images if images is not None else None,
             )
 
         # decoder

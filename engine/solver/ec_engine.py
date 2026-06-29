@@ -21,13 +21,33 @@ from ..optim import ModelEMA
 
 
 def _sum_trainable_losses(loss_dict):
+    excluded_train_loss_keys = {
+        "loss_fsqm_scatter",
+        "loss_fsqm_obj",
+        "loss_fsqm_bg",
+    }
     trainable_terms = [
-        value for value in loss_dict.values()
-        if torch.is_tensor(value) and value.requires_grad
+        value for key, value in loss_dict.items()
+        if torch.is_tensor(value)
+        and value.requires_grad
+        and not key.startswith("stat_")
+        and key not in excluded_train_loss_keys
     ]
     if trainable_terms:
         return sum(trainable_terms)
-    return sum(loss_dict.values())
+    return sum(
+        value for key, value in loss_dict.items()
+        if not key.startswith("stat_")
+        and key not in excluded_train_loss_keys
+    )
+
+
+def _sum_logged_losses(loss_dict):
+    return sum(
+        value for key, value in loss_dict.items()
+        if not key.startswith("stat_")
+        and key not in {"loss_fsqm_scatter", "loss_fsqm_obj", "loss_fsqm_bg"}
+    )
 
 
 def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, criterion: torch.nn.Module,
@@ -108,7 +128,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                 lr_warmup_scheduler.step()
 
         loss_dict_reduced = dist_utils.reduce_dict(loss_dict)
-        loss_value = sum(loss_dict_reduced.values())
+        loss_value = _sum_logged_losses(loss_dict_reduced)
 
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))

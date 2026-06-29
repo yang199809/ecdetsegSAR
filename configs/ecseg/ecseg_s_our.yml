@@ -20,6 +20,9 @@ ECTransformer:
   fsqm_in_channels: [192, 192, 192]
   fsqm_query_dim: 192
   fsqm_use_conf_gate: True
+  fsqm_use_modulation: True
+  fsqm_use_map_only: False
+  fsqm_modulation_target: "query"
   fsqm_max_gamma: 0.05
 
 ECCriterion:
@@ -29,6 +32,8 @@ ECCriterion:
   fsqm_bg_weight: 0.2
   fsqm_rho: 0.4
   fsqm_debug: False
+  fsqm_loss_validity_check: False
+  fsqm_strict_loss_check: False
 
 
 

@@ -54,6 +54,8 @@ class ECCriterion(nn.Module):
         fsqm_bg_weight=0.2,
         fsqm_rho=0.4,
         fsqm_debug=False,
+        fsqm_loss_validity_check=False,
+        fsqm_strict_loss_check=False,
         ):
         super().__init__()
         self.num_classes = num_classes
@@ -77,6 +79,8 @@ class ECCriterion(nn.Module):
         self.fsqm_bg_weight = fsqm_bg_weight
         self.fsqm_rho = fsqm_rho
         self.fsqm_debug = fsqm_debug
+        self.fsqm_loss_validity_check = fsqm_loss_validity_check
+        self.fsqm_strict_loss_check = fsqm_strict_loss_check
 
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         assert 'pred_logits' in outputs
@@ -488,11 +492,24 @@ class ECCriterion(nn.Module):
                     aux_weight=self.fsqm_aux_weight,
                     debug=self.fsqm_debug,
                     training=self.training,
+                    strict=self.fsqm_strict_loss_check,
+                    loss_validity_check=self.fsqm_loss_validity_check,
                 )
             )
 
+        if self.use_fsqm:
+            for key in ["loss_fsqm_scatter", "loss_fsqm_obj", "loss_fsqm_bg", "loss_fsqm_aux"]:
+                if key in losses and torch.is_tensor(losses[key]):
+                    if torch.isnan(losses[key]).any() or torch.isinf(losses[key]).any():
+                        if self.fsqm_strict_loss_check:
+                            raise RuntimeError(f"{key} is NaN or Inf before global nan_to_num")
+
         # For debugging Objects365 pre-train.
-        losses = {k:torch.nan_to_num(v, nan=0.0) for k, v in losses.items()}
+        losses = {
+            k: torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+            if torch.is_tensor(v) else v
+            for k, v in losses.items()
+        }
         return losses
 
     def get_loss_meta_info(self, loss, outputs, targets, indices):

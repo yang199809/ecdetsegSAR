@@ -146,6 +146,24 @@ def _per_image_minmax_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return (x - x_min) / (x_max - x_min + eps)
 
 
+def _source_to_energy(source: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Convert an image or high-dimensional feature map to one energy channel.
+
+    Raw SAR images [B, 1, H, W] keep their intensity, RGB/repeated images use
+    channel mean, and feature maps with C > 3 use RMS/L2 energy to avoid
+    cancellation between positive and negative feature responses.
+    """
+    if source.size(1) == 1:
+        return source
+    if source.size(1) <= 3:
+        return source.mean(dim=1, keepdim=True)
+
+    # RMS/L2 energy avoids channel cancellation for high-dimensional feature
+    # maps and is more stable than max activation from a single outlier channel.
+    # A future ablation can test source.abs().amax(dim=1, keepdim=True).
+    return torch.sqrt(torch.mean(source ** 2, dim=1, keepdim=True) + eps)
+
+
 def _masks_from_targets(gt_masks):
     if isinstance(gt_masks, (list, tuple)) and gt_masks and isinstance(gt_masks[0], dict):
         return [target.get("masks", None) for target in gt_masks]
@@ -218,6 +236,7 @@ def build_scatter_pseudo_targets(
     out_sizes: Iterable[Tuple[int, int]],
     rho: float = 0.4,
     return_object_mask: bool = False,
+    return_stats: bool = False,
 ):
     """Build continuous SAR scattering targets from high-pass response and masks.
 
@@ -230,13 +249,17 @@ def build_scatter_pseudo_targets(
         raise ValueError("source must be provided to build FSQM scatter pseudo targets")
 
     source = source.detach().float()
-    batch_size, _, height, width = source.shape
+    batch_size, channels, height, width = source.shape
     device = source.device
 
-    source_gray = source.mean(dim=1, keepdim=True)
-    source_gray = _per_image_minmax_norm(source_gray)
-    low_freq = F.avg_pool2d(source_gray, kernel_size=7, stride=1, padding=3)
-    high = (source_gray - low_freq).abs()
+    source_energy = _source_to_energy(source)
+    source_energy = _per_image_minmax_norm(source_energy)
+    low_freq = F.avg_pool2d(source_energy, kernel_size=7, stride=1, padding=3)
+
+    # ReLU high-pass emphasizes local strong scattering peaks without boosting
+    # dark valleys. If it becomes too sparse, ablate with:
+    # high = (source_energy - low_freq).abs()
+    high = F.relu(source_energy - low_freq)
     # TODO: replace min-max normalization with percentile clipping if raw SAR
     # intensity with strong outliers is made available by the data pipeline.
     high = _per_image_minmax_norm(high)
@@ -251,6 +274,18 @@ def build_scatter_pseudo_targets(
         pseudo_target = object_target * (rho + (1.0 - rho) * high_target)
         pseudo_targets.append(pseudo_target)
         object_targets.append(object_target)
+
+    if return_stats:
+        stats = {
+            "source_channels": float(channels),
+            "source_energy_mean": _debug_value(source_energy.detach().float().mean()),
+            "source_energy_max": _debug_value(source_energy.detach().float().max()),
+            "high_mean": _debug_value(high.detach().float().mean()),
+            "high_max": _debug_value(high.detach().float().max()),
+        }
+        if return_object_mask:
+            return pseudo_targets, object_mask, object_targets, stats
+        return pseudo_targets, stats
 
     if return_object_mask:
         return pseudo_targets, object_mask, object_targets
@@ -306,6 +341,11 @@ def fsqm_auxiliary_loss(
         if debug:
             _debug_print({
                 "pseudo_source_type": "none",
+                "source_channels": 0.0,
+                "source_energy_mean": 0.0,
+                "source_energy_max": 0.0,
+                "high_mean": 0.0,
+                "high_max": 0.0,
                 "object_mask_sum": 0.0,
                 "pseudo_target_mean": 0.0,
                 "pseudo_target_max": 0.0,
@@ -345,13 +385,19 @@ def fsqm_auxiliary_loss(
         }
 
     out_sizes = [scatter.shape[-2:] for scatter in scatter_maps]
-    pseudo_targets, object_mask, object_targets = build_scatter_pseudo_targets(
+    pseudo_outputs = build_scatter_pseudo_targets(
         pseudo_source,
         targets,
         out_sizes,
         rho=rho,
         return_object_mask=True,
+        return_stats=debug,
     )
+    if debug:
+        pseudo_targets, object_mask, object_targets, source_stats = pseudo_outputs
+    else:
+        pseudo_targets, object_mask, object_targets = pseudo_outputs
+        source_stats = {}
 
     scatter_loss = zero
     obj_loss = zero
@@ -363,8 +409,9 @@ def fsqm_auxiliary_loss(
             scatter_maxes = [scatter.detach().float().max() for scatter in scatter_maps]
             pseudo_means = [pseudo.detach().float().mean() for pseudo in pseudo_targets]
             pseudo_maxes = [pseudo.detach().float().max() for pseudo in pseudo_targets]
-            _debug_print({
-                "pseudo_source_type": pseudo_source_type,
+            stats = {"pseudo_source_type": pseudo_source_type}
+            stats.update(source_stats)
+            stats.update({
                 "object_mask_sum": 0.0,
                 "pseudo_target_mean": _debug_value(torch.stack(pseudo_means).mean()),
                 "pseudo_target_max": _debug_value(torch.stack(pseudo_maxes).max()),
@@ -375,6 +422,7 @@ def fsqm_auxiliary_loss(
                 "loss_fsqm_bg": 0.0,
                 "loss_fsqm_aux": 0.0,
             })
+            _debug_print(stats)
         return {
             "loss_fsqm_scatter": zero.detach(),
             "loss_fsqm_obj": zero.detach(),
@@ -396,7 +444,7 @@ def fsqm_auxiliary_loss(
         scatter_loss = scatter_loss + F.smooth_l1_loss(scatter, pseudo, reduction="mean")
         obj_loss = obj_loss + _dice_loss_from_probs(scatter, object_target)
 
-        background = object_target <= 0
+        background = object_target < 1e-3
         if background.any():
             bg_logits = logit[background]
             bg_loss = bg_loss + F.binary_cross_entropy_with_logits(
@@ -412,8 +460,9 @@ def fsqm_auxiliary_loss(
         pseudo_maxes = [pseudo.detach().float().max() for pseudo in pseudo_targets]
         scatter_means = [scatter.detach().float().mean() for scatter in scatter_maps]
         scatter_maxes = [scatter.detach().float().max() for scatter in scatter_maps]
-        _debug_print({
-            "pseudo_source_type": pseudo_source_type,
+        stats = {"pseudo_source_type": pseudo_source_type}
+        stats.update(source_stats)
+        stats.update({
             "object_mask_sum": _debug_value(object_mask.detach().float().sum()),
             "pseudo_target_mean": _debug_value(torch.stack(pseudo_means).mean()),
             "pseudo_target_max": _debug_value(torch.stack(pseudo_maxes).max()),
@@ -424,6 +473,7 @@ def fsqm_auxiliary_loss(
             "loss_fsqm_bg": _debug_value(bg_loss),
             "loss_fsqm_aux": _debug_value(total_aux),
         })
+        _debug_print(stats)
 
     return {
         "loss_fsqm_scatter": scatter_loss.detach(),

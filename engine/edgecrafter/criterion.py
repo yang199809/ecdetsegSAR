@@ -49,9 +49,11 @@ class ECCriterion(nn.Module):
         use_uni_set=True,
         mask_point_sample_ratio=None,
         use_fsqm=False,
-        fsqm_aux_weight=0.2,
+        fsqm_aux_weight=0.1,
+        fsqm_obj_weight=0.2,
         fsqm_bg_weight=0.2,
-        fsqm_rho=0.15,
+        fsqm_rho=0.4,
+        fsqm_debug=False,
         ):
         super().__init__()
         self.num_classes = num_classes
@@ -71,8 +73,10 @@ class ECCriterion(nn.Module):
         self.mask_point_sample_ratio = matcher.mask_point_sample_ratio
         self.use_fsqm = use_fsqm
         self.fsqm_aux_weight = fsqm_aux_weight
+        self.fsqm_obj_weight = fsqm_obj_weight
         self.fsqm_bg_weight = fsqm_bg_weight
         self.fsqm_rho = fsqm_rho
+        self.fsqm_debug = fsqm_debug
 
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         assert 'pred_logits' in outputs
@@ -480,8 +484,10 @@ class ECCriterion(nn.Module):
                     fsqm_outputs.get('images', None),
                     targets,
                     rho=self.fsqm_rho,
+                    obj_weight=self.fsqm_obj_weight,
                     bg_weight=self.fsqm_bg_weight,
                     aux_weight=self.fsqm_aux_weight,
+                    debug=self.fsqm_debug,
                 )
             )
 

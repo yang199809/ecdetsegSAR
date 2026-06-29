@@ -445,6 +445,8 @@ class ECTransformer(nn.Module):
                  fsqm_in_channels=None,
                  fsqm_query_dim=None,
                  fsqm_hidden_ratio=0.25,
+                 fsqm_use_conf_gate=True,
+                 fsqm_max_gamma=0.05,
                  ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -480,7 +482,13 @@ class ECTransformer(nn.Module):
             assert fsqm_query_dim == hidden_dim, "FSQM query dim must match decoder hidden_dim"
             fsqm_in_channels = fsqm_in_channels or [hidden_dim for _ in range(num_levels)]
             assert len(fsqm_in_channels) == num_levels, "FSQM in_channels must match num_levels"
-            self.fsqm = FSQM(fsqm_in_channels, fsqm_query_dim, hidden_ratio=fsqm_hidden_ratio)
+            self.fsqm = FSQM(
+                fsqm_in_channels,
+                fsqm_query_dim,
+                hidden_ratio=fsqm_hidden_ratio,
+                use_conf_gate=fsqm_use_conf_gate,
+                max_gamma=fsqm_max_gamma,
+            )
         else:
             self.fsqm = None
 

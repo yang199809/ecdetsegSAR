@@ -19,12 +19,16 @@ ECTransformer:
   use_fsqm: True
   fsqm_in_channels: [192, 192, 192]
   fsqm_query_dim: 192
+  fsqm_use_conf_gate: True
+  fsqm_max_gamma: 0.05
 
 ECCriterion:
   use_fsqm: True
-  fsqm_aux_weight: 0.2
+  fsqm_aux_weight: 0.1
+  fsqm_obj_weight: 0.2
   fsqm_bg_weight: 0.2
-  fsqm_rho: 0.15
+  fsqm_rho: 0.4
+  fsqm_debug: False
 
 
 

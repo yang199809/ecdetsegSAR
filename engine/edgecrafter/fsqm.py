@@ -15,7 +15,7 @@ class FSQM(nn.Module):
     FSQM is inserted once before the transformer decoder. It converts the
     FSEM/A3-enhanced multi-scale features into query-specific scattering priors
     through reference-point guided sampling, then injects the prior into object
-    queries with a zero-initialized residual scale.
+    queries with a bounded residual scale and query-level scattering confidence.
     """
 
     def __init__(
@@ -23,11 +23,15 @@ class FSQM(nn.Module):
         in_channels: Sequence[int],
         query_dim: int,
         hidden_ratio: float = 0.25,
+        use_conf_gate: bool = True,
+        max_gamma: float = 0.05,
         eps: float = 1e-6,
     ):
         super().__init__()
         self.eps = eps
         self.query_dim = query_dim
+        self.use_conf_gate = use_conf_gate
+        self.max_gamma = max_gamma
 
         hidden_dim = max(int(query_dim * hidden_ratio), 16)
         self.input_proj = nn.ModuleList()
@@ -52,12 +56,13 @@ class FSQM(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(query_dim, query_dim),
         )
+        self.prior_norm = nn.LayerNorm(query_dim)
         self.gate_proj = nn.Sequential(
             nn.Linear(query_dim, query_dim),
             nn.Sigmoid(),
         )
 
-        self.gamma = nn.Parameter(torch.zeros(1))
+        self.raw_gamma = nn.Parameter(torch.zeros(1))
 
     def forward(self, queries: torch.Tensor, feats: List[torch.Tensor], ref_points: torch.Tensor):
         if len(feats) != len(self.input_proj):
@@ -104,6 +109,10 @@ class FSQM(nn.Module):
             sampled_feats.append(local_feat)
 
         scores = torch.cat(sampled_scores, dim=-1)
+        scatter_conf = scores.max(dim=-1, keepdim=True).values
+        if not self.use_conf_gate:
+            scatter_conf = torch.ones_like(scatter_conf)
+
         weights = scores + 1e-3
         weights = weights / (weights.sum(dim=-1, keepdim=True) + self.eps)
 
@@ -112,12 +121,16 @@ class FSQM(nn.Module):
             prior_feat = prior_feat + weights[..., i:i + 1] * feat_i
 
         prior = self.prior_proj(prior_feat)
+        prior = self.prior_norm(prior)
         gate = self.gate_proj(prior)
-        mod_queries = queries + self.gamma * gate * prior
+        gamma = self.max_gamma * torch.tanh(self.raw_gamma)
+        modulation = gamma * scatter_conf * gate * prior
+        mod_queries = queries + modulation
 
         aux_outputs = {
             "scatter_maps": scatter_maps,
             "scatter_logits": scatter_logits,
+            "scatter_conf": scatter_conf,
         }
         return mod_queries, aux_outputs
 
@@ -199,7 +212,7 @@ def build_scatter_pseudo_targets(
     images: torch.Tensor,
     gt_masks,
     out_sizes: Iterable[Tuple[int, int]],
-    rho: float = 0.15,
+    rho: float = 0.4,
     return_object_mask: bool = False,
 ):
     """Build continuous SAR scattering targets from high-pass response and masks.
@@ -225,15 +238,18 @@ def build_scatter_pseudo_targets(
     high = _per_image_minmax_norm(high)
 
     object_mask = _merge_instance_masks(gt_masks, batch_size, (height, width), device)
-    pseudo = object_mask * (rho + (1.0 - rho) * high)
-
-    pseudo_targets = [
-        F.interpolate(pseudo, size=tuple(size), mode="bilinear", align_corners=False)
-        for size in out_sizes
-    ]
+    pseudo_targets = []
+    object_targets = []
+    for size in out_sizes:
+        size = tuple(size)
+        object_target = F.interpolate(object_mask, size=size, mode="area").clamp_(0.0, 1.0)
+        high_target = F.interpolate(high, size=size, mode="bilinear", align_corners=False)
+        pseudo_target = object_target * (rho + (1.0 - rho) * high_target)
+        pseudo_targets.append(pseudo_target)
+        object_targets.append(object_target)
 
     if return_object_mask:
-        return pseudo_targets, object_mask
+        return pseudo_targets, object_mask, object_targets
     return pseudo_targets
 
 
@@ -248,27 +264,59 @@ def _zero_from_aux(scatter_maps: List[torch.Tensor], scatter_logits: List[torch.
     return zero
 
 
+def _dice_loss_from_probs(inputs: torch.Tensor, targets: torch.Tensor, eps: float = 1.0) -> torch.Tensor:
+    inputs = inputs.flatten(1)
+    targets = targets.flatten(1)
+    numerator = 2.0 * (inputs * targets).sum(dim=1)
+    denominator = inputs.sum(dim=1) + targets.sum(dim=1)
+    return (1.0 - (numerator + eps) / (denominator + eps)).mean()
+
+
+def _debug_value(value: torch.Tensor) -> float:
+    return float(value.detach().float().item())
+
+
+def _debug_print(stats: dict):
+    stats_str = " ".join(f"{key}={value:.6f}" for key, value in stats.items())
+    print(f"[FSQM-v1.1 debug] {stats_str}", flush=True)
+
+
 def fsqm_auxiliary_loss(
     aux_outputs: dict,
     images: Optional[torch.Tensor],
     targets,
-    rho: float = 0.15,
+    rho: float = 0.4,
+    obj_weight: float = 0.2,
     bg_weight: float = 0.2,
-    aux_weight: float = 0.2,
+    aux_weight: float = 0.1,
+    debug: bool = False,
 ):
     scatter_maps = aux_outputs.get("scatter_maps", [])
     scatter_logits = aux_outputs.get("scatter_logits", [])
     zero = _zero_from_aux(scatter_maps, scatter_logits)
 
     if images is None or targets is None or len(scatter_maps) == 0:
+        if debug:
+            _debug_print({
+                "object_mask_sum": 0.0,
+                "pseudo_target_mean": 0.0,
+                "pseudo_target_max": 0.0,
+                "scatter_map_mean": 0.0,
+                "scatter_map_max": 0.0,
+                "loss_fsqm_scatter": 0.0,
+                "loss_fsqm_obj": 0.0,
+                "loss_fsqm_bg": 0.0,
+                "loss_fsqm_aux": 0.0,
+            })
         return {
             "loss_fsqm_scatter": zero.detach(),
+            "loss_fsqm_obj": zero.detach(),
             "loss_fsqm_bg": zero.detach(),
             "loss_fsqm_aux": zero,
         }
 
     out_sizes = [scatter.shape[-2:] for scatter in scatter_maps]
-    pseudo_targets, object_mask = build_scatter_pseudo_targets(
+    pseudo_targets, object_mask, object_targets = build_scatter_pseudo_targets(
         images,
         targets,
         out_sizes,
@@ -276,21 +324,47 @@ def fsqm_auxiliary_loss(
         return_object_mask=True,
     )
 
+    scatter_loss = zero
+    obj_loss = zero
+    bg_loss = zero
+
     if object_mask.sum() == 0:
+        if debug:
+            scatter_means = [scatter.detach().float().mean() for scatter in scatter_maps]
+            scatter_maxes = [scatter.detach().float().max() for scatter in scatter_maps]
+            _debug_print({
+                "object_mask_sum": 0.0,
+                "pseudo_target_mean": 0.0,
+                "pseudo_target_max": 0.0,
+                "scatter_map_mean": _debug_value(torch.stack(scatter_means).mean()),
+                "scatter_map_max": _debug_value(torch.stack(scatter_maxes).max()),
+                "loss_fsqm_scatter": 0.0,
+                "loss_fsqm_obj": 0.0,
+                "loss_fsqm_bg": 0.0,
+                "loss_fsqm_aux": 0.0,
+            })
         return {
             "loss_fsqm_scatter": zero.detach(),
+            "loss_fsqm_obj": zero.detach(),
             "loss_fsqm_bg": zero.detach(),
             "loss_fsqm_aux": zero,
         }
 
-    scatter_loss = zero
-    bg_loss = zero
+    for scatter, logit, pseudo, object_target in zip(
+        scatter_maps,
+        scatter_logits,
+        pseudo_targets,
+        object_targets,
+    ):
+        scatter = scatter.float()
+        logit = logit.float()
+        pseudo = pseudo.to(device=scatter.device, dtype=torch.float32)
+        object_target = object_target.to(device=scatter.device, dtype=torch.float32)
 
-    for scatter, logit, pseudo in zip(scatter_maps, scatter_logits, pseudo_targets):
-        pseudo = pseudo.to(device=scatter.device, dtype=scatter.dtype)
         scatter_loss = scatter_loss + F.smooth_l1_loss(scatter, pseudo, reduction="mean")
+        obj_loss = obj_loss + _dice_loss_from_probs(scatter, object_target)
 
-        background = pseudo <= 0
+        background = object_target <= 0
         if background.any():
             bg_logits = logit[background]
             bg_loss = bg_loss + F.binary_cross_entropy_with_logits(
@@ -299,9 +373,28 @@ def fsqm_auxiliary_loss(
                 reduction="mean",
             )
 
-    total_aux = aux_weight * (scatter_loss + bg_weight * bg_loss)
+    total_aux = aux_weight * (scatter_loss + obj_weight * obj_loss + bg_weight * bg_loss)
+
+    if debug:
+        pseudo_means = [pseudo.detach().float().mean() for pseudo in pseudo_targets]
+        pseudo_maxes = [pseudo.detach().float().max() for pseudo in pseudo_targets]
+        scatter_means = [scatter.detach().float().mean() for scatter in scatter_maps]
+        scatter_maxes = [scatter.detach().float().max() for scatter in scatter_maps]
+        _debug_print({
+            "object_mask_sum": _debug_value(object_mask.detach().float().sum()),
+            "pseudo_target_mean": _debug_value(torch.stack(pseudo_means).mean()),
+            "pseudo_target_max": _debug_value(torch.stack(pseudo_maxes).max()),
+            "scatter_map_mean": _debug_value(torch.stack(scatter_means).mean()),
+            "scatter_map_max": _debug_value(torch.stack(scatter_maxes).max()),
+            "loss_fsqm_scatter": _debug_value(scatter_loss),
+            "loss_fsqm_obj": _debug_value(obj_loss),
+            "loss_fsqm_bg": _debug_value(bg_loss),
+            "loss_fsqm_aux": _debug_value(total_aux),
+        })
+
     return {
         "loss_fsqm_scatter": scatter_loss.detach(),
+        "loss_fsqm_obj": obj_loss.detach(),
         "loss_fsqm_bg": bg_loss.detach(),
         "loss_fsqm_aux": total_aux,
     }

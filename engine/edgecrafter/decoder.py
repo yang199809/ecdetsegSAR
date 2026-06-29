@@ -404,10 +404,12 @@ class TransformerDecoder(nn.Module):
                 spatial_features=spatial_features,   # fused_feats[0], backbone feature
                 query_features=dec_out_hs,           # list[Tensor], [N,B,Nq,C]
             )
+            coarse_dec_out_segs = None
             if scmr is not None and scmr_use_refined_loss:
                 if scmr_scatter_map is None:
                     raise ValueError("SCMR requires a DWT-derived scatter_map from FSEM/A3.")
                 low_feat = scmr_low_feat if scmr_low_feat is not None else spatial_features
+                coarse_dec_out_segs = dec_out_segs
                 # SCMR is instance-level: refine coarse mask logits with DWT
                 # scattering prior, masked object/background context, and query FiLM.
                 dec_out_segs = [
@@ -417,11 +419,12 @@ class TransformerDecoder(nn.Module):
 
             return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), \
                 torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), torch.stack(dec_out_segs), \
-                pre_bboxes, pre_scores, dec_out_segs[-1]
+                pre_bboxes, pre_scores, dec_out_segs[-1], \
+                torch.stack(coarse_dec_out_segs) if coarse_dec_out_segs is not None else None
         else:
             return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), \
                 torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), None, \
-                pre_bboxes, pre_scores, None
+                pre_bboxes, pre_scores, None, None
 
 @register()
 class ECTransformer(nn.Module):
@@ -802,7 +805,7 @@ class ECTransformer(nn.Module):
             )
 
         # decoder
-        out_bboxes, out_logits, out_corners, out_refs, out_masks, pre_bboxes, pre_logits, pre_segs  = self.decoder(
+        out_bboxes, out_logits, out_corners, out_refs, out_masks, pre_bboxes, pre_logits, pre_segs, coarse_out_masks  = self.decoder(
                 spatial_feat,
                 init_ref_contents,
                 init_ref_points_unact,
@@ -832,6 +835,7 @@ class ECTransformer(nn.Module):
             dn_out_logits, out_logits = self._split(out_logits, 2, s_idx)
             dn_out_bboxes, out_bboxes = self._split(out_bboxes, 2, s_idx)
             dn_out_masks, out_masks = self._split(out_masks, 2, s_idx)
+            _, coarse_out_masks = self._split(coarse_out_masks, 2, s_idx)
             dn_out_corners, out_corners =self._split(out_corners, 2, s_idx)
             dn_out_refs, out_refs = self._split(out_refs, 2, s_idx)
 
@@ -855,6 +859,9 @@ class ECTransformer(nn.Module):
                                                         dn_out_corners[-1], dn_out_logits[-1])
                 out['dn_pre_outputs'] = {'pred_logits': dn_pre_logits, 'pred_boxes': dn_pre_bboxes, 'pred_masks': dn_pre_segs}
                 out['dn_meta'] = dn_meta
+
+        if self.use_scmr and coarse_out_masks is not None:
+            out['coarse_pred_masks'] = coarse_out_masks[-1]
 
         if self.training and self.use_fsqm and fsqm_aux is not None:
             fsqm_aux['images'] = images

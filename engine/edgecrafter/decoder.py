@@ -826,7 +826,8 @@ class ECTransformer(nn.Module):
                 out['dn_meta'] = dn_meta
 
         if self.training and self.use_fsqm and fsqm_aux is not None:
-            fsqm_aux['images'] = images
+            if images is not None:
+                fsqm_aux['images'] = images.detach()
             out['fsqm_aux_outputs'] = fsqm_aux
 
         return out

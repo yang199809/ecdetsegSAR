@@ -481,13 +481,13 @@ class ECCriterion(nn.Module):
             losses.update(
                 fsqm_auxiliary_loss(
                     fsqm_outputs,
-                    fsqm_outputs.get('images', None),
                     targets,
                     rho=self.fsqm_rho,
                     obj_weight=self.fsqm_obj_weight,
                     bg_weight=self.fsqm_bg_weight,
                     aux_weight=self.fsqm_aux_weight,
                     debug=self.fsqm_debug,
+                    training=self.training,
                 )
             )
 

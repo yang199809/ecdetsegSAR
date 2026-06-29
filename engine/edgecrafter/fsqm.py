@@ -69,12 +69,14 @@ class FSQM(nn.Module):
             raise ValueError(f"FSQM got {len(feats)} feature levels, expected {len(self.input_proj)}")
 
         if ref_points.size(-1) == 4:
-            ref_points = ref_points[..., :2]
-        elif ref_points.size(-1) != 2:
+            fsqm_ref_points = ref_points[..., :2].detach()
+        elif ref_points.size(-1) == 2:
+            fsqm_ref_points = ref_points.detach()
+        else:
             raise ValueError(f"FSQM expects ref_points last dim 2 or 4, got {ref_points.size(-1)}")
 
-        ref_points = ref_points.clamp(0.0, 1.0)
-        grid = (ref_points * 2.0 - 1.0).unsqueeze(2)
+        fsqm_ref_points = fsqm_ref_points.clamp(0.0, 1.0)
+        grid = (fsqm_ref_points * 2.0 - 1.0).unsqueeze(2)
 
         scatter_logits = []
         scatter_maps = []
@@ -85,12 +87,13 @@ class FSQM(nn.Module):
             feat_proj = proj(feat)
             logit = head(feat_proj)
             scatter = torch.sigmoid(logit)
+            scatter_dilated = F.max_pool2d(scatter, kernel_size=3, stride=1, padding=1)
 
             scatter_logits.append(logit)
             scatter_maps.append(scatter)
 
             score = F.grid_sample(
-                scatter,
+                scatter_dilated,
                 grid,
                 mode="bilinear",
                 padding_mode="zeros",
@@ -131,6 +134,7 @@ class FSQM(nn.Module):
             "scatter_maps": scatter_maps,
             "scatter_logits": scatter_logits,
             "scatter_conf": scatter_conf,
+            "base_feat": feats[0].detach(),
         }
         return mod_queries, aux_outputs
 
@@ -209,7 +213,7 @@ def _merge_instance_masks(gt_masks, batch_size: int, image_size: Tuple[int, int]
 
 
 def build_scatter_pseudo_targets(
-    images: torch.Tensor,
+    source: torch.Tensor,
     gt_masks,
     out_sizes: Iterable[Tuple[int, int]],
     rho: float = 0.4,
@@ -218,21 +222,21 @@ def build_scatter_pseudo_targets(
     """Build continuous SAR scattering targets from high-pass response and masks.
 
     The pseudo-label is M * (rho + (1 - rho) * H), where H is a high-frequency
-    response map estimated from the current normalized model input. A later data
-    pipeline can replace this with raw SAR intensity without changing FSQM.
+    response map estimated from either the current normalized model input or a
+    detached feature fallback when images are not available.
     """
 
-    if images is None:
-        raise ValueError("images must be provided to build FSQM scatter pseudo targets")
+    if source is None:
+        raise ValueError("source must be provided to build FSQM scatter pseudo targets")
 
-    images = images.float()
-    batch_size, _, height, width = images.shape
-    device = images.device
+    source = source.detach().float()
+    batch_size, _, height, width = source.shape
+    device = source.device
 
-    image_gray = images.mean(dim=1, keepdim=True)
-    image_gray = _per_image_minmax_norm(image_gray)
-    low_freq = F.avg_pool2d(image_gray, kernel_size=7, stride=1, padding=3)
-    high = (image_gray - low_freq).abs()
+    source_gray = source.mean(dim=1, keepdim=True)
+    source_gray = _per_image_minmax_norm(source_gray)
+    low_freq = F.avg_pool2d(source_gray, kernel_size=7, stride=1, padding=3)
+    high = (source_gray - low_freq).abs()
     # TODO: replace min-max normalization with percentile clipping if raw SAR
     # intensity with strong outliers is made available by the data pipeline.
     high = _per_image_minmax_norm(high)
@@ -277,27 +281,31 @@ def _debug_value(value: torch.Tensor) -> float:
 
 
 def _debug_print(stats: dict):
-    stats_str = " ".join(f"{key}={value:.6f}" for key, value in stats.items())
+    stats_str = " ".join(
+        f"{key}={value}" if isinstance(value, str) else f"{key}={value:.6f}"
+        for key, value in stats.items()
+    )
     print(f"[FSQM-v1.1 debug] {stats_str}", flush=True)
 
 
 def fsqm_auxiliary_loss(
     aux_outputs: dict,
-    images: Optional[torch.Tensor],
     targets,
     rho: float = 0.4,
     obj_weight: float = 0.2,
     bg_weight: float = 0.2,
     aux_weight: float = 0.1,
     debug: bool = False,
+    training: bool = True,
 ):
     scatter_maps = aux_outputs.get("scatter_maps", [])
     scatter_logits = aux_outputs.get("scatter_logits", [])
     zero = _zero_from_aux(scatter_maps, scatter_logits)
 
-    if images is None or targets is None or len(scatter_maps) == 0:
+    if targets is None or len(scatter_maps) == 0:
         if debug:
             _debug_print({
+                "pseudo_source_type": "none",
                 "object_mask_sum": 0.0,
                 "pseudo_target_mean": 0.0,
                 "pseudo_target_max": 0.0,
@@ -315,9 +323,30 @@ def fsqm_auxiliary_loss(
             "loss_fsqm_aux": zero,
         }
 
+    images = aux_outputs.get("images", None)
+    base_feat = aux_outputs.get("base_feat", None)
+    if images is not None:
+        pseudo_source = images
+        pseudo_source_type = "image"
+    elif base_feat is not None:
+        pseudo_source = base_feat
+        pseudo_source_type = "feature"
+    elif training or debug:
+        raise RuntimeError(
+            "FSQM auxiliary loss needs either aux_outputs['images'] or "
+            "aux_outputs['base_feat'] to build pseudo targets."
+        )
+    else:
+        return {
+            "loss_fsqm_scatter": zero.detach(),
+            "loss_fsqm_obj": zero.detach(),
+            "loss_fsqm_bg": zero.detach(),
+            "loss_fsqm_aux": zero,
+        }
+
     out_sizes = [scatter.shape[-2:] for scatter in scatter_maps]
     pseudo_targets, object_mask, object_targets = build_scatter_pseudo_targets(
-        images,
+        pseudo_source,
         targets,
         out_sizes,
         rho=rho,
@@ -332,10 +361,13 @@ def fsqm_auxiliary_loss(
         if debug:
             scatter_means = [scatter.detach().float().mean() for scatter in scatter_maps]
             scatter_maxes = [scatter.detach().float().max() for scatter in scatter_maps]
+            pseudo_means = [pseudo.detach().float().mean() for pseudo in pseudo_targets]
+            pseudo_maxes = [pseudo.detach().float().max() for pseudo in pseudo_targets]
             _debug_print({
+                "pseudo_source_type": pseudo_source_type,
                 "object_mask_sum": 0.0,
-                "pseudo_target_mean": 0.0,
-                "pseudo_target_max": 0.0,
+                "pseudo_target_mean": _debug_value(torch.stack(pseudo_means).mean()),
+                "pseudo_target_max": _debug_value(torch.stack(pseudo_maxes).max()),
                 "scatter_map_mean": _debug_value(torch.stack(scatter_means).mean()),
                 "scatter_map_max": _debug_value(torch.stack(scatter_maxes).max()),
                 "loss_fsqm_scatter": 0.0,
@@ -381,6 +413,7 @@ def fsqm_auxiliary_loss(
         scatter_means = [scatter.detach().float().mean() for scatter in scatter_maps]
         scatter_maxes = [scatter.detach().float().max() for scatter in scatter_maps]
         _debug_print({
+            "pseudo_source_type": pseudo_source_type,
             "object_mask_sum": _debug_value(object_mask.detach().float().sum()),
             "pseudo_target_mean": _debug_value(torch.stack(pseudo_means).mean()),
             "pseudo_target_max": _debug_value(torch.stack(pseudo_maxes).max()),

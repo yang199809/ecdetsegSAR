@@ -36,14 +36,18 @@ class _ECBase(nn.Module):
 class ECDet(_ECBase):
 
     def forward(self, x, targets=None):
+        images = x
         x = self.forward_features(x)
-        return self.decoder(x, targets)
+        scatter_map = getattr(self.backbone, 'last_scatter_map', None)
+        return self.decoder(x, targets, images=images, scatter_map=scatter_map)
 
 
 @register()
 class ECSeg(_ECBase):
 
     def forward(self, x, targets=None):
+        images = x
         x = self.forward_features(x)
         spatial_feat = x[0]
-        return self.decoder(x, targets, spatial_feat)
+        scatter_map = getattr(self.backbone, 'last_scatter_map', None)
+        return self.decoder(x, targets, spatial_feat, images=images, scatter_map=scatter_map)

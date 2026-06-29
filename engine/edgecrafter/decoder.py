@@ -22,6 +22,8 @@ import torch.nn.init as init
 
 from ..core import register
 from .denoising import get_contrastive_denoising_training_group
+from .fsqm import FSQM
+from .scmr import SCMR
 from .segmentation_head import SegmentationHead
 from .utils import (bias_init_with_prob, deformable_attention_core_func_v2,
                     distance2bbox, get_activation, inverse_sigmoid,
@@ -337,7 +339,11 @@ class TransformerDecoder(nn.Module):
                 reg_scale,
                 attn_mask=None,
                 memory_mask=None,
-                dn_meta=None):
+                dn_meta=None,
+                scmr=None,
+                scmr_low_feat=None,
+                scmr_scatter_map=None,
+                scmr_use_refined_loss=True):
         output = target
         output_detach = pred_corners_undetach = 0
         value = self.value_op(memory, None, None, memory_mask, spatial_shapes)
@@ -398,6 +404,16 @@ class TransformerDecoder(nn.Module):
                 spatial_features=spatial_features,   # fused_feats[0], backbone feature
                 query_features=dec_out_hs,           # list[Tensor], [N,B,Nq,C]
             )
+            if scmr is not None and scmr_use_refined_loss:
+                if scmr_scatter_map is None:
+                    raise ValueError("SCMR requires a DWT-derived scatter_map from FSEM/A3.")
+                low_feat = scmr_low_feat if scmr_low_feat is not None else spatial_features
+                # SCMR is instance-level: refine coarse mask logits with DWT
+                # scattering prior, masked object/background context, and query FiLM.
+                dec_out_segs = [
+                    scmr(coarse_mask, low_feat, scmr_scatter_map, query_feat)
+                    for coarse_mask, query_feat in zip(dec_out_segs, dec_out_hs)
+                ]
 
             return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), \
                 torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), torch.stack(dec_out_segs), \
@@ -440,6 +456,16 @@ class ECTransformer(nn.Module):
                  share_bbox_head=False,
                  share_score_head=False,
                  mask_downsample_ratio=None,
+                 use_fsqm=False,
+                 fsqm_in_channels=None,
+                 fsqm_query_dim=None,
+                 fsqm_hidden_ratio=0.25,
+                 use_scmr=False,
+                 scmr_hidden_dim=128,
+                 scmr_ring_kernel=7,
+                 scmr_film_scale=0.1,
+                 scmr_use_refined_loss=True,
+                 scmr_low_channels=None,
                  ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -460,6 +486,9 @@ class ECTransformer(nn.Module):
         self.eval_spatial_size = eval_spatial_size
         self.aux_loss = aux_loss
         self.reg_max = reg_max
+        self.use_fsqm = use_fsqm
+        self.use_scmr = use_scmr
+        self.scmr_use_refined_loss = scmr_use_refined_loss
 
         assert query_select_method in ('default', 'one2many', 'agnostic'), ''
         assert cross_attn_method in ('default', 'discrete'), ''
@@ -468,6 +497,15 @@ class ECTransformer(nn.Module):
 
         # backbone feature projection
         self._build_input_proj_layer(feat_channels)
+
+        fsqm_query_dim = hidden_dim if fsqm_query_dim is None else fsqm_query_dim
+        if self.use_fsqm:
+            assert fsqm_query_dim == hidden_dim, "FSQM query dim must match decoder hidden_dim"
+            fsqm_in_channels = fsqm_in_channels or [hidden_dim for _ in range(num_levels)]
+            assert len(fsqm_in_channels) == num_levels, "FSQM in_channels must match num_levels"
+            self.fsqm = FSQM(fsqm_in_channels, fsqm_query_dim, hidden_ratio=fsqm_hidden_ratio)
+        else:
+            self.fsqm = None
 
         # Transformer module
         self.up = nn.Parameter(torch.tensor([0.5]), requires_grad=False)
@@ -479,6 +517,18 @@ class ECTransformer(nn.Module):
         
         # SegmetationHead
         segmentation_head = SegmentationHead(hidden_dim, num_layers, downsample_ratio=mask_downsample_ratio, image_size=eval_spatial_size) if mask_downsample_ratio else None
+        if self.use_scmr:
+            assert segmentation_head is not None, "SCMR requires mask_downsample_ratio and a segmentation head"
+            scmr_low_channels = hidden_dim if scmr_low_channels is None else scmr_low_channels
+            self.scmr = SCMR(
+                c_low=scmr_low_channels,
+                q_dim=hidden_dim,
+                hidden_dim=scmr_hidden_dim,
+                ring_kernel=scmr_ring_kernel,
+                film_scale=scmr_film_scale,
+            )
+        else:
+            self.scmr = None
         
         self.decoder = TransformerDecoder(hidden_dim, decoder_layer, decoder_layer_wide, segmentation_head, num_layers, nhead,
                                           reg_max, self.reg_scale, self.up, eval_idx, layer_scale, act=activation)
@@ -588,7 +638,7 @@ class ECTransformer(nn.Module):
                 )
                 in_channels = self.hidden_dim
 
-    def _get_encoder_input(self, feats: List[torch.Tensor]):
+    def _get_encoder_input(self, feats: List[torch.Tensor], return_proj_feats=False):
         # get projection features
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
         if self.num_levels > len(proj_feats):
@@ -611,6 +661,8 @@ class ECTransformer(nn.Module):
 
         # [b, l, c]
         feat_flatten = torch.concat(feat_flatten, 1)
+        if return_proj_feats:
+            return feat_flatten, spatial_shapes, proj_feats
         return feat_flatten, spatial_shapes
 
     def _generate_anchors(self,
@@ -714,9 +766,13 @@ class ECTransformer(nn.Module):
     def _split(x, dim, s_idx):
         return torch.split(x, s_idx, dim=dim) if x is not None else (None, None)
 
-    def forward(self, feats, targets=None, spatial_feat=None):
+    def forward(self, feats, targets=None, spatial_feat=None, images=None, scatter_map=None):
         # input projection and embedding
-        memory, spatial_shapes = self._get_encoder_input(feats)
+        if self.use_fsqm:
+            memory, spatial_shapes, proj_feats = self._get_encoder_input(feats, return_proj_feats=True)
+        else:
+            memory, spatial_shapes = self._get_encoder_input(feats)
+            proj_feats = None
 
         # prepare denoising training
         if self.training and self.num_denoising > 0:
@@ -735,6 +791,16 @@ class ECTransformer(nn.Module):
         init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list = \
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
+        fsqm_aux = None
+        if self.use_fsqm:
+            # Decoder reference points are stored as inverse-sigmoid boxes; FSQM
+            # samples with normalized [0, 1] centers before the original decoder.
+            init_ref_contents, fsqm_aux = self.fsqm(
+                init_ref_contents,
+                proj_feats,
+                F.sigmoid(init_ref_points_unact),
+            )
+
         # decoder
         out_bboxes, out_logits, out_corners, out_refs, out_masks, pre_bboxes, pre_logits, pre_segs  = self.decoder(
                 spatial_feat,
@@ -750,7 +816,11 @@ class ECTransformer(nn.Module):
                 self.up,
                 self.reg_scale,
                 attn_mask=attn_mask,
-                dn_meta=dn_meta)    
+                dn_meta=dn_meta,
+                scmr=self.scmr if self.use_scmr else None,
+                scmr_low_feat=spatial_feat,
+                scmr_scatter_map=scatter_map,
+                scmr_use_refined_loss=self.scmr_use_refined_loss)    
 
         s_idx = dn_meta['dn_num_split'] if dn_meta is not None else None
 
@@ -785,6 +855,10 @@ class ECTransformer(nn.Module):
                                                         dn_out_corners[-1], dn_out_logits[-1])
                 out['dn_pre_outputs'] = {'pred_logits': dn_pre_logits, 'pred_boxes': dn_pre_bboxes, 'pred_masks': dn_pre_segs}
                 out['dn_meta'] = dn_meta
+
+        if self.training and self.use_fsqm and fsqm_aux is not None:
+            fsqm_aux['images'] = images
+            out['fsqm_aux_outputs'] = fsqm_aux
 
         return out
 
@@ -841,4 +915,3 @@ class ECTransformer(nn.Module):
             results.append(result)
 
         return results
-

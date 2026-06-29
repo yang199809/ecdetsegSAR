@@ -20,6 +20,16 @@ from ..misc import MetricLogger, SmoothedValue, dist_utils
 from ..optim import ModelEMA
 
 
+def _sum_trainable_losses(loss_dict):
+    trainable_terms = [
+        value for value in loss_dict.values()
+        if torch.is_tensor(value) and value.requires_grad
+    ]
+    if trainable_terms:
+        return sum(trainable_terms)
+    return sum(loss_dict.values())
+
+
 def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, **kwargs):
@@ -63,7 +73,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
             with torch.autocast(device_type=str(device), enabled=False):
                 loss_dict = criterion(outputs, targets, **metas)
 
-            loss = sum(loss_dict.values())
+            loss = _sum_trainable_losses(loss_dict)
             scaler.scale(loss).backward()
 
             if max_norm > 0:
@@ -78,7 +88,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
             outputs = model(samples, targets=targets)
             loss_dict = criterion(outputs, targets, **metas)
 
-            loss : torch.Tensor = sum(loss_dict.values())
+            loss : torch.Tensor = _sum_trainable_losses(loss_dict)
             optimizer.zero_grad()
             loss.backward()
 

@@ -10,7 +10,10 @@ Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 from .criterion import ECCriterion
 from .decoder import ECTransformer
 from .ecvit import ViTAdapter
+from .fsqm import FSQM
 from .hybrid_encoder import HybridEncoder
 from .matcher import HungarianMatcher
 from .modeling import ECDet, ECSeg
 from .postprocessor import PostProcessor
+from .scmr import SCMR
+from .fsem import OSAFSEMBlock

@@ -4,13 +4,34 @@ __include__: [
   'ecseg.yml',
 ]
 
-output_dir: outputs/ecseg_s_ssdd_0.0004_newpyramid_FSEM_v1_stem
+output_dir: outputs/ecseg_s_ssdd_0.0004_newpyramid_FSEM_V3_A4-1
 
 ViTAdapter:
   name: ecseg_vitt
   weights_path: ecvits/ecseg_vitt.pth
   use_sta: True
   conv_inplane: 32
+  interaction_indexes: [10, 11]
+  use_c2_sem_refine: True
+  c2_sem_refine_init_scale: 0.001
+  return_scatter_map: True
+
+ECTransformer:
+  use_fsqm: True
+  fsqm_in_channels: [192, 192, 192]
+  fsqm_query_dim: 192
+  use_scmr: True
+  scmr_hidden_dim: 128
+  scmr_ring_kernel: 7
+  scmr_film_scale: 0.1
+  scmr_use_refined_loss: True
+
+ECCriterion:
+  use_fsqm: True
+  fsqm_aux_weight: 0.2
+  fsqm_bg_weight: 0.2
+  fsqm_rho: 0.15
+
 
 
 optimizer:

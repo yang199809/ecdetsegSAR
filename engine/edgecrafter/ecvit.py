@@ -578,9 +578,108 @@ class FreqBranch(nn.Module):
         y = self.out_proj(y)
         return y
 
+
+# =========================================================
+# 4. Band-Decoupled Wavelet Branch
+# =========================================================
+
+class SpatialSubBandGate(nn.Module):
+    """Spatially preserved gate over LL/LH/HL/HH wavelet bands."""
+    def __init__(self, dim: int, reduction: int = 4):
+        super().__init__()
+        hidden = max(dim // reduction, 8)
+        self.gate = nn.Sequential(
+            nn.Conv2d(4 * dim, hidden, kernel_size=3, padding=1, bias=True),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, 4 * dim, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, bands):
+        return self.gate(bands)
+
+
+class BandDecoupledFreqBranch(nn.Module):
+    """
+    Band-decoupled wavelet branch:
+        DWT
+        -> spatial sub-band gate
+        -> independent LL/LH/HL/HH processing
+        -> IDWT
+        -> output projection
+    """
+    def __init__(self, dim: int, reduction: int = 4, act: str = "silu"):
+        super().__init__()
+        self.band_gate = SpatialSubBandGate(dim, reduction=reduction)
+        self.ll_branch = self._make_subband_branch(dim, act)
+        self.lh_branch = self._make_subband_branch(dim, act)
+        self.hl_branch = self._make_subband_branch(dim, act)
+        self.hh_branch = self._make_subband_branch(dim, act)
+        self.out_proj = ConvNormLayer_fuse(
+            dim,
+            dim,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            act=act,
+        )
+
+    @staticmethod
+    def _make_subband_branch(dim: int, act: str):
+        return nn.Sequential(
+            ConvNormLayer_fuse(
+                dim,
+                dim,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                act=act,
+            ),
+            ConvNormLayer_fuse(
+                dim,
+                dim,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                g=dim,
+                act=act,
+            ),
+        )
+
+    def forward(self, x):
+        bands, orig_hw = haar_dwt(x)
+        weights = self.band_gate(bands)
+
+        LL, LH, HL, HH = bands.chunk(4, dim=1)
+        w_LL, w_LH, w_HL, w_HH = weights.chunk(4, dim=1)
+
+        LL = self.ll_branch(LL * w_LL)
+        LH = self.lh_branch(LH * w_LH)
+        HL = self.hl_branch(HL * w_HL)
+        HH = self.hh_branch(HH * w_HH)
+
+        bands = torch.cat([LL, LH, HL, HH], dim=1)
+        y = haar_idwt(bands, orig_hw)
+        y = self.out_proj(y)
+        return y
+
 # =========================================================
 # 5. FSAS Branch
 # =========================================================
+
+class LayerNorm2d(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        x = x.permute(0, 2, 3, 1)
+        x = F.layer_norm(x, (x.shape[-1],), self.weight, self.bias, self.eps)
+        x = x.permute(0, 3, 1, 2)
+        return x
+
 
 class FSASBranch(nn.Module):
     """
@@ -612,8 +711,8 @@ class FSASBranch(nn.Module):
             bias=False,
         )
 
-        # EdgeCrafter mainly uses BatchNorm2d in conv feature branches.
-        self.corr_norm = nn.BatchNorm2d(dim)
+        self.corr_norm = LayerNorm2d(dim)
+        self.log_scale = nn.Parameter(torch.zeros(1))
 
         self.proj = ConvNormLayer_fuse(
             dim,
@@ -641,7 +740,8 @@ class FSASBranch(nn.Module):
         )
 
         corr = self.corr_norm(corr.to(dtype))
-        corr = torch.sigmoid(corr)
+        scale_factor = torch.exp(0.5 * torch.tanh(self.log_scale))
+        corr = torch.sigmoid(corr * scale_factor)
 
         y = v * corr
         y = self.proj(y)
@@ -687,11 +787,11 @@ class FSEMBlock(nn.Module):
 
         self.spatial_branch = SpatialBranch(out_dim, act=act)
 
-        self.freq_branch = FreqBranch(
-            out_dim,
-            reconstruct=freq_reconstruct,
-            act=act,
-        ) if not use_fsas else FSASBranch(out_dim, act=act)
+        self.freq_branch = (
+            BandDecoupledFreqBranch(out_dim, act=act)
+            if not use_fsas
+            else FSASBranch(out_dim, act=act)
+        )
 
         fuse_in = out_dim * 2
 
@@ -767,6 +867,41 @@ class SpatialFreqModule(nn.Module):
         return c2, c3, c4
 
 
+class SemanticC2Refinement(nn.Module):
+    """
+    Lightweight residual refinement for the upsampled C2 semantic feature.
+
+    This module is intentionally applied only to the ViT semantic branch before
+    concatenating it with the C2 detail feature from SpatialFreqModule. It keeps
+    the A3 [10, 11] semantic source unchanged and only mitigates the smoothness
+    introduced by bilinear upsampling from the 1/16 ViT token map to the 1/8 C2
+    semantic map.
+    """
+    def __init__(self, dim: int, act: str = "silu", init_scale: float = 1e-3):
+        super().__init__()
+        self.dw3 = ConvNormLayer_fuse(
+            dim,
+            dim,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            g=dim,
+            act=act,
+        )
+        self.pw = ConvNormLayer_fuse(
+            dim,
+            dim,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            act=None,
+        )
+        self.beta = nn.Parameter(torch.ones(1) * init_scale)
+
+    def forward(self, x):
+        return x + self.beta * self.pw(self.dw3(x))
+
+
 @register()
 class ViTAdapter(nn.Module):
     
@@ -800,6 +935,8 @@ class ViTAdapter(nn.Module):
         ffn_layer='mlp',
         ffn_ratio=4,
         skip_load_backbone=False,
+        use_c2_sem_refine=False,
+        c2_sem_refine_init_scale=1e-3,
         **kwargs
     ):
         super().__init__()
@@ -831,6 +968,21 @@ class ViTAdapter(nn.Module):
         
         if num_levels != 3:
             raise NotImplementedError("Only support num_levels=3 for ViTAdapter now.")
+
+        self.use_c2_sem_refine = use_c2_sem_refine
+        self.c2_sem_refine = (
+            SemanticC2Refinement(
+                embed_dim,
+                init_scale=c2_sem_refine_init_scale,
+            )
+            if use_c2_sem_refine
+            else nn.Identity()
+        )
+        if use_c2_sem_refine:
+            print(
+                f"Using C2 semantic refinement with "
+                f"init_scale={c2_sem_refine_init_scale}"
+            )
 
         # self.proj_dim = [proj_dim] * num_levels if proj_dim is not None else [embed_dim]
 
@@ -927,7 +1079,14 @@ class ViTAdapter(nn.Module):
             scale = 2 ** (1 - i)
             resize_H = int(H_c * scale)
             resize_W = int(W_c * scale)
-            feature = F.interpolate(fused_feats, size=[resize_H, resize_W], mode="bilinear", align_corners=False)
+            feature = F.interpolate(
+                fused_feats,
+                size=[resize_H, resize_W],
+                mode="bilinear",
+                align_corners=False,
+            )
+            if i == 0:
+                feature = self.c2_sem_refine(feature)
             proj_feats.append(feature)
             
         # fusion
